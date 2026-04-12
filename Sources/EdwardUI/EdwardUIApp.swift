@@ -1,0 +1,650 @@
+import SwiftUI
+import EdwardCore
+
+@main
+struct EdwardUIApp: App {
+    @StateObject private var viewModel = EdwardViewModel()
+
+    var body: some Scene {
+        MenuBarExtra("Edward", systemImage: viewModel.isRunning ? "tortoise.fill" : "tortoise") {
+            EdwardMenuView(viewModel: viewModel)
+        }
+        .menuBarExtraStyle(.window)
+
+        Window("Edward Transcripts", id: "transcripts") {
+            TranscriptWindowView(viewModel: viewModel)
+                .onAppear {
+                    NSApplication.shared.setActivationPolicy(.regular)
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                }
+                .onDisappear {
+                    // Go back to accessory mode when transcript window closes
+                    let hasVisibleWindows = NSApplication.shared.windows.contains { $0.isVisible && $0.title == "Edward Transcripts" }
+                    if !hasVisibleWindows {
+                        NSApplication.shared.setActivationPolicy(.accessory)
+                    }
+                }
+        }
+        .defaultSize(width: 600, height: 500)
+
+        Settings {
+            SettingsView(viewModel: viewModel)
+        }
+    }
+}
+
+// MARK: - Available Languages
+
+struct LanguageOption: Identifiable, Hashable {
+    let id: String // language code
+    let name: String
+    let flag: String
+}
+
+let availableLanguages: [LanguageOption] = [
+    LanguageOption(id: "en", name: "English", flag: "EN"),
+    LanguageOption(id: "nl", name: "Dutch", flag: "NL"),
+]
+
+// MARK: - ViewModel
+
+@MainActor
+class EdwardViewModel: ObservableObject {
+    @Published var isRunning = false
+    @Published var isLoading = false
+    @Published var transcripts: [TranscriptEntry] = []
+    @Published var statusText = "Stopped"
+    @Published var errorMessage: String?
+    @Published var selectedLanguages: Set<String> = ["en"]
+    @Published var partialText: String?
+
+    private var daemon: EdwardDaemon?
+
+    init() {
+        // Load saved language preferences
+        let saved = UserDefaults.standard.stringArray(forKey: "selectedLanguages")
+        if let saved = saved, !saved.isEmpty {
+            selectedLanguages = Set(saved)
+        }
+
+        // Load recent transcripts from database
+        let config = EdwardConfig.load()
+        let storage = Storage(config: config)
+        if let _ = try? storage.open(),
+           let recent = try? storage.recent(limit: 50) {
+            transcripts = recent.reversed()
+        }
+
+        // Auto-open transcript window on launch
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            NSApplication.shared.setActivationPolicy(.regular)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            for window in NSApplication.shared.windows {
+                if window.title == "Edward Transcripts" {
+                    window.makeKeyAndOrderFront(nil)
+                    return
+                }
+            }
+        }
+    }
+
+    func saveLanguagePreferences() {
+        UserDefaults.standard.set(Array(selectedLanguages), forKey: "selectedLanguages")
+    }
+
+    func toggleLanguage(_ code: String) {
+        if selectedLanguages.contains(code) {
+            if selectedLanguages.count > 1 {
+                selectedLanguages.remove(code)
+            }
+            // Don't allow removing the last language
+        } else {
+            selectedLanguages.insert(code)
+        }
+        saveLanguagePreferences()
+    }
+
+    var languageSummary: String {
+        let names = availableLanguages
+            .filter { selectedLanguages.contains($0.id) }
+            .map { $0.name }
+        return names.joined(separator: ", ")
+    }
+
+    func toggleDaemon() {
+        if isRunning {
+            stop()
+        } else {
+            Task { await start() }
+        }
+    }
+
+    func start() async {
+        isLoading = true
+        statusText = "Loading models..."
+        errorMessage = nil
+
+        var config = EdwardConfig.load()
+        config.languages = Array(selectedLanguages)
+
+        let daemon = EdwardDaemon(config: config)
+        self.daemon = daemon
+
+        daemon.onTranscription = { [weak self] entry in
+            Task { @MainActor in
+                self?.partialText = nil
+                self?.transcripts.append(entry)
+                if (self?.transcripts.count ?? 0) > 200 {
+                    self?.transcripts.removeFirst()
+                }
+            }
+        }
+
+        daemon.onPartialTranscription = { [weak self] text in
+            Task { @MainActor in
+                self?.partialText = text
+            }
+        }
+
+        daemon.onWordTimestampsReady = { [weak self] entryId, timestamps in
+            Task { @MainActor in
+                if let idx = self?.transcripts.firstIndex(where: { $0.id == entryId }) {
+                    self?.transcripts[idx].wordTimestamps = timestamps
+                }
+            }
+        }
+
+        do {
+            try await daemon.initialize()
+            try daemon.start()
+            isRunning = true
+            isLoading = false
+            statusText = "Listening (\(languageSummary))"
+        } catch {
+            isLoading = false
+            isRunning = false
+            statusText = "Error"
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func stop() {
+        daemon?.stop()
+        daemon = nil
+        isRunning = false
+        statusText = "Stopped"
+    }
+}
+
+// MARK: - Menu Bar View
+
+struct EdwardMenuView: View {
+    @ObservedObject var viewModel: EdwardViewModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Status header
+            HStack {
+                Circle()
+                    .fill(viewModel.isRunning ? .green : .gray)
+                    .frame(width: 8, height: 8)
+                Text(viewModel.statusText)
+                    .font(.headline)
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.top, 8)
+
+            if let error = viewModel.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .padding(.horizontal)
+            }
+
+            Divider()
+
+            // Language selection
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Languages")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    ForEach(availableLanguages) { lang in
+                        LanguageToggle(
+                            lang: lang,
+                            isSelected: viewModel.selectedLanguages.contains(lang.id),
+                            isDisabled: viewModel.isRunning
+                        ) {
+                            viewModel.toggleLanguage(lang.id)
+                        }
+                    }
+                    Spacer()
+                }
+            }
+            .padding(.horizontal)
+
+            if viewModel.isRunning {
+                Text("Stop listening to change languages")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal)
+            }
+
+            Divider()
+
+            // Recent transcripts
+            if viewModel.transcripts.isEmpty {
+                Text("No transcriptions yet")
+                    .foregroundColor(.secondary)
+                    .font(.caption)
+                    .padding(.horizontal)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(viewModel.transcripts.suffix(10), id: \.id) { entry in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 4) {
+                                        if let _ = entry.speakerId {
+                                            Text(entry.speakerLabel)
+                                                .font(.caption)
+                                                .fontWeight(.semibold)
+                                                .foregroundColor(.accentColor)
+                                        }
+                                        Spacer()
+                                        Text(entry.timeString)
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Text(entry.text)
+                                        .font(.system(.body, design: .default))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .id(entry.id)
+                                .padding(.horizontal)
+                                .padding(.vertical, 2)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 300)
+                    .onAppear {
+                        if let last = viewModel.transcripts.suffix(10).last {
+                            proxy.scrollTo(last.id, anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: viewModel.transcripts.count) {
+                        if let last = viewModel.transcripts.suffix(10).last {
+                            proxy.scrollTo(last.id, anchor: .bottom)
+                        }
+                    }
+                }
+            }
+
+            // Partial transcription indicator
+            if let partial = viewModel.partialText {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text(partial)
+                        .font(.system(.body, design: .default))
+                        .italic()
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 4)
+            }
+
+            Divider()
+            Button(action: { viewModel.toggleDaemon() }) {
+                HStack {
+                    if viewModel.isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: viewModel.isRunning ? "stop.fill" : "play.fill")
+                    }
+                    Text(viewModel.isLoading ? "Loading..." : (viewModel.isRunning ? "Stop Listening" : "Start Listening"))
+                }
+            }
+            .disabled(viewModel.isLoading)
+            .padding(.horizontal)
+
+            Button(action: {
+                NSApplication.shared.setActivationPolicy(.regular)
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                DispatchQueue.main.async {
+                    openWindow(id: "transcripts")
+                }
+            }) {
+                HStack {
+                    Image(systemName: "list.bullet")
+                    Text("Open Transcript Window")
+                }
+            }
+            .padding(.horizontal)
+
+            Divider()
+
+            Button("Quit Edward") {
+                viewModel.stop()
+                NSApplication.shared.terminate(nil)
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 8)
+        }
+        .frame(width: 320)
+    }
+}
+
+// MARK: - Language Toggle Button
+
+struct LanguageToggle: View {
+    let lang: LanguageOption
+    let isSelected: Bool
+    let isDisabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.caption)
+                Text(lang.name)
+                    .font(.caption)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(isSelected ? Color.accentColor.opacity(0.15) : Color.gray.opacity(0.1))
+            .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.6 : 1.0)
+    }
+}
+
+// MARK: - Settings View
+
+struct SettingsView: View {
+    @ObservedObject var viewModel: EdwardViewModel
+
+    var body: some View {
+        Form {
+            Section("Languages") {
+                Text("Select which languages are spoken. The ASR model will prioritize these.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                ForEach(availableLanguages) { lang in
+                    Toggle(isOn: Binding(
+                        get: { viewModel.selectedLanguages.contains(lang.id) },
+                        set: { _ in viewModel.toggleLanguage(lang.id) }
+                    )) {
+                        HStack {
+                            Text(lang.flag)
+                                .font(.caption)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 2)
+                                .background(Color.gray.opacity(0.2))
+                                .cornerRadius(3)
+                            Text(lang.name)
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 350, height: 200)
+    }
+}
+
+// MARK: - Transcript Window
+
+struct TranscriptWindowView: View {
+    @ObservedObject var viewModel: EdwardViewModel
+    @State private var searchText = ""
+    @State private var autoScroll = true
+
+    var filteredTranscripts: [TranscriptEntry] {
+        if searchText.isEmpty {
+            return viewModel.transcripts
+        }
+        return viewModel.transcripts.filter {
+            $0.text.localizedCaseInsensitiveContains(searchText)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Toolbar
+            HStack {
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("Search transcripts...", text: $searchText)
+                        .textFieldStyle(.plain)
+                }
+                .padding(8)
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(8)
+
+                Spacer()
+
+                // Language badges
+                HStack(spacing: 4) {
+                    ForEach(Array(viewModel.selectedLanguages.sorted()), id: \.self) { code in
+                        Text(code.uppercased())
+                            .font(.system(.caption2, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.accentColor.opacity(0.15))
+                            .cornerRadius(4)
+                    }
+                }
+
+                Circle()
+                    .fill(viewModel.isRunning ? .green : .gray)
+                    .frame(width: 10, height: 10)
+                Text(viewModel.statusText)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .padding()
+
+            Divider()
+
+            // Transcript list
+            if filteredTranscripts.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: "mic.slash")
+                        .font(.largeTitle)
+                        .foregroundColor(.secondary)
+                    Text(viewModel.isRunning ? "Listening... speak to see transcripts" : "Start the daemon to begin")
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(filteredTranscripts, id: \.id) { entry in
+                                TranscriptRowView(entry: entry)
+                                    .onAppear {
+                                        if entry.id == filteredTranscripts.last?.id {
+                                            autoScroll = true
+                                        }
+                                    }
+                                    .onDisappear {
+                                        if entry.id == filteredTranscripts.last?.id {
+                                            autoScroll = false
+                                        }
+                                    }
+                                Divider()
+                            }
+                        }
+                    }
+                    .onAppear {
+                        if let last = filteredTranscripts.last {
+                            proxy.scrollTo(last.id, anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: viewModel.transcripts.count) {
+                        if autoScroll, let last = filteredTranscripts.last {
+                            proxy.scrollTo(last.id, anchor: .bottom)
+                        }
+                    }
+                }
+            }
+
+            // Fixed partial transcription bar
+            if let partial = viewModel.partialText {
+                Divider()
+                HStack(alignment: .top, spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.top, 2)
+                    Text(partial)
+                        .font(.body)
+                        .italic()
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+                .background(Color(nsColor: .controlBackgroundColor))
+            }
+        }
+        .frame(minWidth: 400, minHeight: 300)
+    }
+}
+
+// MARK: - Transcript Row
+
+struct TranscriptRowView: View {
+    let entry: TranscriptEntry
+    @State private var showWordTimestamps = false
+
+    private var speakerColor: Color {
+        guard let id = entry.speakerId else { return .secondary }
+        let colors: [Color] = [.blue, .green, .orange, .purple, .pink, .cyan, .mint, .indigo]
+        let hash = abs(id.hashValue)
+        return colors[hash % colors.count]
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                if let _ = entry.speakerId {
+                    Text(entry.speakerLabel)
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(speakerColor)
+                }
+
+                if showWordTimestamps, let words = entry.wordTimestamps {
+                    WordTimestampView(words: words)
+                } else {
+                    Text(entry.text)
+                        .font(.body)
+                        .textSelection(.enabled)
+                }
+
+                HStack(spacing: 8) {
+                    Text("\(String(format: "%.1f", entry.duration))s")
+                    if let conf = entry.speakerConfidence {
+                        Text("speaker: \(String(format: "%.0f%%", conf * 100))")
+                    }
+                    Text("processed in \(String(format: "%.2f", entry.processingTime))s")
+                    if entry.wordTimestamps != nil {
+                        Button(action: { showWordTimestamps.toggle() }) {
+                            Text(showWordTimestamps ? "hide timing" : "show timing")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.accentColor)
+                    }
+                }
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            }
+
+            Spacer()
+
+            Text(entry.timeString)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+}
+
+// MARK: - Word Timestamp View
+
+struct WordTimestampView: View {
+    let words: [WordTimestamp]
+
+    var body: some View {
+        FlowLayout(spacing: 4) {
+            ForEach(Array(words.enumerated()), id: \.offset) { _, word in
+                VStack(spacing: 0) {
+                    Text(word.text)
+                        .font(.body)
+                    Text(String(format: "%.2f", word.startTime))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 3)
+                .padding(.vertical, 2)
+                .background(Color.accentColor.opacity(0.08))
+                .cornerRadius(4)
+            }
+        }
+        .textSelection(.enabled)
+    }
+}
+
+// Simple flow layout for wrapping word chips
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let result = layout(proposal: proposal, subviews: subviews)
+        return result.size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let result = layout(proposal: proposal, subviews: subviews)
+        for (index, position) in result.positions.enumerated() {
+            subviews[index].place(at: CGPoint(x: bounds.minX + position.x, y: bounds.minY + position.y), proposal: .unspecified)
+        }
+    }
+
+    private func layout(proposal: ProposedViewSize, subviews: Subviews) -> (size: CGSize, positions: [CGPoint]) {
+        let maxWidth = proposal.width ?? .infinity
+        var positions: [CGPoint] = []
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x + size.width > maxWidth, x > 0 {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            positions.append(CGPoint(x: x, y: y))
+            rowHeight = max(rowHeight, size.height)
+            x += size.width + spacing
+        }
+
+        return (CGSize(width: maxWidth, height: y + rowHeight), positions)
+    }
+}

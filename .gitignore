@@ -1,0 +1,34 @@
+# Claude / Playwright
+.claude
+.playwright-mcp
+
+# Swift / SPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# App bundles (built artifacts)
+Edward.app/Contents/MacOS/
+EdwardUI.app/Contents/MacOS/
+
+# MLX Metal shaders
+mlx.metallib
+
+# Edward runtime data
+.edward/
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
