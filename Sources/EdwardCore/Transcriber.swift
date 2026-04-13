@@ -29,7 +29,8 @@ public final class Transcriber {
         guard let model = model else {
             throw EdwardError.modelLoadError("ASR model not loaded")
         }
-
+ 
+        
         let startTime = Date()
 
         // Use explicit language or first configured language, nil = auto-detect
@@ -95,6 +96,7 @@ public struct TranscriptEntry: Codable, Sendable {
     public var speakerConfidence: Float?
     public var audioPath: String?
     public var wordTimestamps: [WordTimestamp]?
+    public var source: String?
 
     public var timestampString: String {
         let formatter = ISO8601DateFormatter()

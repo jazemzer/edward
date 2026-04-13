@@ -92,6 +92,22 @@ public final class Storage {
             sqlite3_exec(db, "ALTER TABLE transcripts ADD COLUMN word_timestamps TEXT;", nil, nil, nil)
             log.info("Migrated database: added word_timestamps column")
         }
+
+        // Check if source column exists
+        var hasSource = false
+        var stmt3: OpaquePointer?
+        guard sqlite3_prepare_v2(db, checkSql, -1, &stmt3, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt3) }
+        while sqlite3_step(stmt3) == SQLITE_ROW {
+            let colName = String(cString: sqlite3_column_text(stmt3, 1))
+            if colName == "source" { hasSource = true }
+        }
+
+        if !hasSource {
+            sqlite3_exec(db, "ALTER TABLE transcripts ADD COLUMN source TEXT;", nil, nil, nil)
+            sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_transcripts_source ON transcripts(source);", nil, nil, nil)
+            log.info("Migrated database: added source column")
+        }
     }
 
     /// Save a transcript entry to SQLite and daily file
@@ -104,8 +120,8 @@ public final class Storage {
         // Insert into SQLite
         try queue.sync {
             let sql = """
-            INSERT INTO transcripts (timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, audio_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO transcripts (timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, audio_path, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -139,6 +155,11 @@ public final class Storage {
             } else {
                 sqlite3_bind_null(stmt, 8)
             }
+            if let src = entry.source {
+                sqlite3_bind_text(stmt, 9, (src as NSString).utf8String, -1, nil)
+            } else {
+                sqlite3_bind_null(stmt, 9)
+            }
 
             guard sqlite3_step(stmt) == SQLITE_DONE else {
                 throw EdwardError.storageError("Cannot insert: \(String(cString: sqlite3_errmsg(db)))")
@@ -156,7 +177,7 @@ public final class Storage {
     public func recent(limit: Int = 20) throws -> [TranscriptEntry] {
         guard let db = db else { throw EdwardError.storageError("Database not open") }
 
-        let sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, word_timestamps FROM transcripts ORDER BY id DESC LIMIT ?;"
+        let sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, word_timestamps, source FROM transcripts ORDER BY id DESC LIMIT ?;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw EdwardError.storageError("Cannot prepare query")
@@ -171,7 +192,7 @@ public final class Storage {
     public func search(query: String, limit: Int = 50) throws -> [TranscriptEntry] {
         guard let db = db else { throw EdwardError.storageError("Database not open") }
 
-        let sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, word_timestamps FROM transcripts WHERE text LIKE ? ORDER BY id DESC LIMIT ?;"
+        let sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, word_timestamps, source FROM transcripts WHERE text LIKE ? ORDER BY id DESC LIMIT ?;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw EdwardError.storageError("Cannot prepare search")
@@ -189,7 +210,7 @@ public final class Storage {
     public func bySpeaker(speakerId: String, limit: Int = 50) throws -> [TranscriptEntry] {
         guard let db = db else { throw EdwardError.storageError("Database not open") }
 
-        let sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, word_timestamps FROM transcripts WHERE speaker_id = ? ORDER BY id DESC LIMIT ?;"
+        let sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, word_timestamps, source FROM transcripts WHERE speaker_id = ? ORDER BY id DESC LIMIT ?;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw EdwardError.storageError("Cannot prepare speaker query")
@@ -296,9 +317,9 @@ public final class Storage {
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyy-MM-dd"
             let dateStr = formatter.string(from: date)
-            sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, audio_path, word_timestamps FROM transcripts WHERE audio_path IS NOT NULL AND timestamp LIKE '\(dateStr)%' ORDER BY id;"
+            sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, audio_path, word_timestamps, source FROM transcripts WHERE audio_path IS NOT NULL AND timestamp LIKE '\(dateStr)%' ORDER BY id;"
         } else {
-            sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, audio_path, word_timestamps FROM transcripts WHERE audio_path IS NOT NULL ORDER BY id;"
+            sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, audio_path, word_timestamps, source FROM transcripts WHERE audio_path IS NOT NULL ORDER BY id;"
         }
 
         var stmt: OpaquePointer?
@@ -336,12 +357,16 @@ public final class Storage {
                 }
             }
 
+            let source: String? = sqlite3_column_type(stmt, 10) != SQLITE_NULL
+                ? String(cString: sqlite3_column_text(stmt, 10)) : nil
+
             let timestamp = formatter.date(from: tsStr) ?? Date()
             results.append(TranscriptEntry(
                 id: id, timestamp: timestamp, duration: duration, text: text,
                 processingTime: processingTime, speakerId: speakerId,
                 speakerName: speakerName, speakerConfidence: speakerConfidence,
-                audioPath: audioPath, wordTimestamps: wordTimestamps
+                audioPath: audioPath, wordTimestamps: wordTimestamps,
+                source: source
             ))
         }
         return results
@@ -374,6 +399,9 @@ public final class Storage {
                 }
             }
 
+            let source: String? = sqlite3_column_type(stmt, 9) != SQLITE_NULL
+                ? String(cString: sqlite3_column_text(stmt, 9)) : nil
+
             let timestamp = formatter.date(from: tsStr) ?? Date()
             results.append(TranscriptEntry(
                 id: id,
@@ -384,7 +412,8 @@ public final class Storage {
                 speakerId: speakerId,
                 speakerName: speakerName,
                 speakerConfidence: speakerConfidence,
-                wordTimestamps: wordTimestamps
+                wordTimestamps: wordTimestamps,
+                source: source
             ))
         }
 

@@ -25,6 +25,7 @@ let package = Package(
             path: "Sources/EdwardCore",
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
+                .linkedFramework("ScreenCaptureKit"),
             ]
         ),
         .executableTarget(

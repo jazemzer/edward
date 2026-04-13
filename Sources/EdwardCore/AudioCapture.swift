@@ -3,17 +3,17 @@ import Foundation
 
 /// Captures audio from the microphone using AVAudioEngine
 /// Delivers 16kHz mono Float32 samples via a callback
-public final class AudioCapture {
+public final class AudioCapture: AudioSource {
     private let engine = AVAudioEngine()
-    private let ringBuffer: RingBuffer
     private let sampleRate: Int
     private var onSamples: (([Float]) -> Void)?
 
+    public let sourceId = "mic"
+    public let sourceLabel = "Microphone"
     public private(set) var isRunning = false
 
-    public init(config: EdwardConfig, ringBuffer: RingBuffer) {
+    public init(config: EdwardConfig) {
         self.sampleRate = config.sampleRate
-        self.ringBuffer = ringBuffer
     }
 
     /// Start capturing audio from the default input device
@@ -61,7 +61,6 @@ public final class AudioCapture {
 
             guard !samples.isEmpty else { return }
 
-            self.ringBuffer.write(samples)
             self.onSamples?(samples)
         }
 

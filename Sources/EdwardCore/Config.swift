@@ -13,6 +13,9 @@ public struct EdwardConfig: Codable {
     public var enableNoiseSupression: Bool
     public var enableForcedAlignment: Bool
     public var partialTranscriptionInterval: Double
+    public var enableMicCapture: Bool
+    public var enableSystemAudioCapture: Bool
+    public var systemAudioApps: [SystemAudioApp]
     public var dataDir: String
     public var socketPath: String
     public var logPath: String
@@ -29,6 +32,9 @@ public struct EdwardConfig: Codable {
         enableNoiseSupression: false,
         enableForcedAlignment: false,
         partialTranscriptionInterval: 1.5,
+        enableMicCapture: true,
+        enableSystemAudioCapture: true,
+        systemAudioApps: SystemAudioApp.defaults,
         dataDir: "~/.edward".expandingTildeInPath,
         socketPath: "~/.edward/edward.sock".expandingTildeInPath,
         logPath: "~/.edward/logs/edward.log".expandingTildeInPath
@@ -75,4 +81,23 @@ extension String {
         }
         return self
     }
+}
+
+/// App configuration for system audio capture
+public struct SystemAudioApp: Codable {
+    public var bundleId: String
+    public var label: String
+    public var enabled: Bool
+
+    public init(bundleId: String, label: String, enabled: Bool) {
+        self.bundleId = bundleId
+        self.label = label
+        self.enabled = enabled
+    }
+
+    public static let defaults: [SystemAudioApp] = [
+        SystemAudioApp(bundleId: "us.zoom.xos", label: "Zoom", enabled: true),
+        SystemAudioApp(bundleId: "com.google.Chrome", label: "Chrome", enabled: true),
+        SystemAudioApp(bundleId: "com.microsoft.teams2", label: "Teams", enabled: false),
+    ]
 }

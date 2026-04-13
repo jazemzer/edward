@@ -1,34 +1,26 @@
 import Foundation
 import AudioCommon
 
-/// The main Edward daemon — orchestrates audio capture, VAD, transcription, and output
+/// The main Edward daemon — orchestrates audio pipelines, transcription, and output
 public final class EdwardDaemon {
     private let config: EdwardConfig
-    private let ringBuffer: RingBuffer
-    private let audioCapture: AudioCapture
-    private let vadProcessor: VADProcessor
     private let transcriber: Transcriber
     private let speakerTracker: SpeakerTracker
     private let forcedAligner: ForcedAlignerWrapper
     private let storage: Storage
     private let socketServer: SocketServer
 
-    private var sampleCounter: Int = 0
+    private var pipelines: [AudioPipeline] = []
     private var captureStartTime: Date?
     private var isRunning = false
-
-    // Partial transcription state
-    private var partialTimer: DispatchSourceTimer?
-    private var speechStartSampleCount: Int = 0
-    private var partialGeneration: Int = 0
 
     // Auto-diarization state
     private var lastSpeechTime: Date?
     private var undiarizedEntryCount: Int = 0
     private var silenceTimer: DispatchSourceTimer?
     private var isDiarizing = false
-    private let silenceCheckInterval: TimeInterval = 10 // check every 10s
-    private let silenceThreshold: TimeInterval = 60     // 1 minute of silence triggers diarization
+    private let silenceCheckInterval: TimeInterval = 10
+    private let silenceThreshold: TimeInterval = 60
 
     /// Callback fired on every new transcription (for UI integration)
     public var onTranscription: ((TranscriptEntry) -> Void)?
@@ -40,13 +32,10 @@ public final class EdwardDaemon {
     public var onWordTimestampsReady: ((Int64, [WordTimestamp]) -> Void)?
 
     /// Callback fired when offline diarization completes
-    public var onDiarizationComplete: ((Int, Int) -> Void)? // (numSpeakers, entriesUpdated)
+    public var onDiarizationComplete: ((Int, Int) -> Void)?
 
     public init(config: EdwardConfig = .default) {
         self.config = config
-        self.ringBuffer = RingBuffer(capacity: Int(config.ringBufferDuration) * config.sampleRate)
-        self.audioCapture = AudioCapture(config: config, ringBuffer: ringBuffer)
-        self.vadProcessor = VADProcessor(config: config)
         self.transcriber = Transcriber(config: config)
         self.speakerTracker = SpeakerTracker(config: config)
         self.forcedAligner = ForcedAlignerWrapper()
@@ -62,11 +51,7 @@ public final class EdwardDaemon {
         try config.ensureDirectories()
         try storage.open()
 
-        // Load models sequentially for better error reporting
-        print("  Loading VAD model...")
-        fflush(stdout)
-        try await vadProcessor.load()
-
+        // Load ASR model
         print("  Loading ASR model (this may download ~680MB on first run)...")
         fflush(stdout)
         try await transcriber.load()
@@ -82,12 +67,40 @@ public final class EdwardDaemon {
             try await forcedAligner.load()
         }
 
-        // Set up VAD callbacks
-        vadProcessor.onSpeechStarted = { [weak self] time in
-            self?.handleSpeechStarted(time: time)
+        // Build pipelines
+        pipelines = []
+
+        if config.enableMicCapture {
+            let micSource = AudioCapture(config: config)
+            let micPipeline = AudioPipeline(source: micSource, config: config, transcriber: transcriber, storage: storage)
+            print("  Loading VAD model (mic)...")
+            fflush(stdout)
+            try await micPipeline.loadVAD()
+            pipelines.append(micPipeline)
         }
-        vadProcessor.onSpeechEnded = { [weak self] segment in
-            self?.handleSpeechEnded(segment: segment)
+
+        if config.enableSystemAudioCapture {
+            for app in config.systemAudioApps where app.enabled {
+                let systemSource = SystemAudioSource(bundleId: app.bundleId, label: app.label)
+                let pipeline = AudioPipeline(source: systemSource, config: config, transcriber: transcriber, storage: storage)
+                print("  Loading VAD model (\(app.label))...")
+                fflush(stdout)
+                try await pipeline.loadVAD()
+                pipelines.append(pipeline)
+            }
+        }
+
+        // Wire pipeline callbacks
+        for pipeline in pipelines {
+            pipeline.onTranscription = { [weak self] entry in
+                self?.handleTranscription(entry: entry)
+            }
+            pipeline.onPartialTranscription = { [weak self] text in
+                self?.onPartialTranscription?(text)
+            }
+            pipeline.onPostTranscription = { [weak self] entry, audio in
+                self?.handlePostTranscription(entry: entry, audio: audio)
+            }
         }
 
         // Start socket server
@@ -96,38 +109,39 @@ public final class EdwardDaemon {
         // Request notification permission
         NotificationManager.shared.requestPermission()
 
-        log.info("Edward initialized")
+        log.info("Edward initialized with \(pipelines.count) pipeline(s)")
     }
 
-    /// Start the daemon — begins listening
+    /// Start the daemon — begins listening on all pipelines
     public func start() throws {
         guard !isRunning else { return }
 
         captureStartTime = Date()
-        sampleCounter = 0
 
-        try audioCapture.start { [weak self] samples in
-            self?.vadProcessor.process(samples: samples)
-            self?.sampleCounter += samples.count
+        for pipeline in pipelines {
+            do {
+                try pipeline.start()
+            } catch {
+                log.error("Failed to start pipeline \(pipeline.source.sourceId): \(error)")
+            }
         }
 
-        // Start silence monitoring timer
         startSilenceMonitor()
 
         isRunning = true
-        log.info("Edward daemon started — listening...")
+        log.info("Edward daemon started — \(pipelines.count) pipeline(s) listening...")
     }
 
-    /// Stop the daemon.
+    /// Stop the daemon
     public func stop() {
         guard isRunning else { return }
 
         silenceTimer?.cancel()
         silenceTimer = nil
-        partialTimer?.cancel()
-        partialTimer = nil
-        vadProcessor.flush()
-        audioCapture.stop()
+
+        for pipeline in pipelines {
+            pipeline.stop()
+        }
 
         socketServer.stop()
         try? speakerTracker.save()
@@ -137,109 +151,44 @@ public final class EdwardDaemon {
         log.info("Edward daemon stopped")
     }
 
+    /// Active source labels
+    public var activeSources: [String] {
+        pipelines.filter { $0.source.isRunning }.map { $0.source.sourceLabel }
+    }
+
     /// Status info
     public var status: DaemonStatus {
         let uptime = captureStartTime.map { Date().timeIntervalSince($0) } ?? 0
         return DaemonStatus(
             isRunning: isRunning,
             uptime: uptime,
-            samplesProcessed: sampleCounter,
+            samplesProcessed: 0,
             connectedClients: socketServer.clientCount
         )
     }
 
-    // MARK: - Private
+    // MARK: - Pipeline Callbacks
 
-    private func handleSpeechStarted(time: Float) {
+    private func handleTranscription(entry: TranscriptEntry) {
         lastSpeechTime = Date()
-        speechStartSampleCount = sampleCounter
-        partialGeneration += 1
-        startPartialTimer()
+        undiarizedEntryCount += 1
+
+        socketServer.broadcast(entry)
+        NotificationManager.shared.notify(entry: entry)
+        onTranscription?(entry)
     }
 
-    private func handleSpeechEnded(segment: AudioCommon.SpeechSegment) {
-        let duration = segment.endTime - segment.startTime
-        guard Double(duration) >= config.minSpeechDuration else { return }
-
-        lastSpeechTime = Date()
-        partialTimer?.cancel()
-        partialTimer = nil
-        partialGeneration += 1
-
-        // Extract audio from ring buffer
-        let sampleCount = Int(Double(duration) * Double(config.sampleRate))
-        let audio = ringBuffer.readLast(sampleCount)
-        guard !audio.isEmpty else { return }
-
-        // Transcribe asynchronously (speaker labeling done offline)
+    private func handlePostTranscription(entry: TranscriptEntry, audio: [Float]) {
+        guard config.enableForcedAlignment else { return }
+        let entryId = entry.id
+        let entryText = entry.text
+        let lang = config.languages.first ?? "English"
         Task {
-            do {
-                var entry = try await transcriber.transcribe(audio: audio, sampleRate: config.sampleRate)
-
-                // Skip empty or very short transcriptions
-                let trimmed = entry.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty, trimmed.count > 1 else { return }
-
-                // Save audio segment for offline diarization
-                let audioPath = try storage.saveAudio(audio, sampleRate: config.sampleRate, timestamp: entry.timestamp)
-                entry.audioPath = audioPath
-
-                // Save to storage
-                entry = try storage.save(entry)
-                undiarizedEntryCount += 1
-
-                // Broadcast to socket clients
-                socketServer.broadcast(entry)
-
-                // Send notification
-                NotificationManager.shared.notify(entry: entry)
-
-                // Fire callback for UI
-                onTranscription?(entry)
-
-                // Run forced alignment if enabled
-                if config.enableForcedAlignment {
-                    let entryId = entry.id
-                    let entryText = entry.text
-                    let lang = config.languages.first ?? "English"
-                    Task {
-                        if let timestamps = await self.forcedAligner.align(audio: audio, text: entryText, sampleRate: self.config.sampleRate, language: lang) {
-                            try? self.storage.updateWordTimestamps(id: entryId, timestamps: timestamps)
-                            self.onWordTimestampsReady?(entryId, timestamps)
-                        }
-                    }
-                }
-            } catch {
-                log.error("Transcription failed: \(error)")
+            if let timestamps = await forcedAligner.align(audio: audio, text: entryText, sampleRate: config.sampleRate, language: lang) {
+                try? storage.updateWordTimestamps(id: entryId, timestamps: timestamps)
+                onWordTimestampsReady?(entryId, timestamps)
             }
         }
-    }
-
-    // MARK: - Partial Transcription
-
-    private func startPartialTimer() {
-        partialTimer?.cancel()
-        let interval = config.partialTranscriptionInterval
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
-        timer.schedule(deadline: .now() + interval, repeating: interval)
-        let gen = partialGeneration
-        timer.setEventHandler { [weak self] in
-            guard let self = self, self.partialGeneration == gen else { return }
-            let samplesSinceSpeech = self.sampleCounter - self.speechStartSampleCount
-            guard samplesSinceSpeech > self.config.sampleRate / 2 else { return } // at least 0.5s
-            let audio = self.ringBuffer.readLast(samplesSinceSpeech)
-            guard !audio.isEmpty else { return }
-            Task {
-                guard self.partialGeneration == gen else { return }
-                if let text = await self.transcriber.transcribePartial(audio: audio, sampleRate: self.config.sampleRate) {
-                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty, self.partialGeneration == gen else { return }
-                    self.onPartialTranscription?(trimmed)
-                }
-            }
-        }
-        timer.resume()
-        partialTimer = timer
     }
 
     // MARK: - Auto Diarization
@@ -255,16 +204,11 @@ public final class EdwardDaemon {
     }
 
     private func checkSilenceAndDiarize() {
-        // Don't run if already diarizing or no undiarized entries
         guard !isDiarizing, undiarizedEntryCount >= 2 else { return }
-
-        // Check if we've had enough silence
         guard let lastSpeech = lastSpeechTime else { return }
         let silenceDuration = Date().timeIntervalSince(lastSpeech)
-
         guard silenceDuration >= silenceThreshold else { return }
 
-        // Trigger offline diarization
         isDiarizing = true
         let count = undiarizedEntryCount
         log.info("Auto-diarization triggered after \(Int(silenceDuration))s of silence (\(count) segments)")
@@ -274,7 +218,6 @@ public final class EdwardDaemon {
         Task {
             do {
                 let entries = try storage.entriesWithAudio(date: Date())
-                // Only diarize entries that don't have speaker labels yet
                 let unlabeled = entries.filter { $0.speakerId == nil }
 
                 guard !unlabeled.isEmpty else {
@@ -293,7 +236,6 @@ public final class EdwardDaemon {
                 fflush(stdout)
 
                 onDiarizationComplete?(result.numSpeakers, result.entriesUpdated)
-
                 log.info("Auto-diarization complete: \(result.numSpeakers) speakers, \(result.entriesUpdated) entries")
             } catch {
                 isDiarizing = false

@@ -19,18 +19,27 @@ public final class OfflineDiarizer {
             return OfflineDiarizationResult(numSpeakers: 0, entriesUpdated: 0)
         }
 
+        // Limit to prevent hanging on very large batches
+        let maxEntries = 30
+        let entriesToProcess = entries.count > maxEntries ? Array(entries.suffix(maxEntries)) : entries
+
+        if entries.count > maxEntries {
+            print("Limiting diarization to last \(maxEntries) of \(entries.count) segments")
+            fflush(stdout)
+        }
+
         print("Loading diarization pipeline (pyannote + WeSpeaker)...")
         fflush(stdout)
-        let pipeline = try await PyannoteDiarizationPipeline.fromPretrained()
+        var pipeline: PyannoteDiarizationPipeline? = try await PyannoteDiarizationPipeline.fromPretrained()
 
         // Load and concatenate all audio segments with gaps between them
-        print("Loading \(entries.count) audio segments...")
+        print("Loading \(entriesToProcess.count) audio segments...")
         fflush(stdout)
 
         var allAudio: [Float] = []
         var segmentMap: [(entryId: Int64, startSample: Int, endSample: Int)] = []
 
-        for entry in entries {
+        for entry in entriesToProcess {
             guard let audioPath = entry.audioPath,
                   FileManager.default.fileExists(atPath: audioPath) else {
                 continue
@@ -59,7 +68,10 @@ public final class OfflineDiarizer {
         fflush(stdout)
 
         // Run full pipeline with config to get DiarizationResult (not just [DiarizedSegment])
-        let diarResult = pipeline.diarize(audio: allAudio, sampleRate: config.sampleRate, config: .default)
+        let diarResult = pipeline!.diarize(audio: allAudio, sampleRate: config.sampleRate, config: .default)
+
+        // Release the pipeline immediately to free VRAM
+        pipeline = nil
 
         print("Found \(diarResult.numSpeakers) speakers in \(diarResult.segments.count) diarized segments")
         fflush(stdout)
