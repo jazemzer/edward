@@ -12,7 +12,7 @@ bundle: build
 		cp .build/debug/Edward Edward.app/Contents/MacOS/Edward; \
 		cp .build/debug/mlx.metallib Edward.app/Contents/MacOS/mlx.metallib; \
 		codesign --force --sign - Edward.app/Contents/MacOS/mlx.metallib; \
-		codesign --force --sign - Edward.app; \
+		codesign --force --sign - --entitlements Edward.entitlements Edward.app; \
 		echo "Built Edward.app (binary changed, re-signed)"; \
 	else \
 		echo "Edward.app binary is up to date"; \

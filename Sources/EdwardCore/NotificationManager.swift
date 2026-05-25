@@ -20,7 +20,7 @@ public final class NotificationManager {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
             self.isAuthorized = granted
             if let error = error {
-                log.error("Notification permission error: \(error)")
+                log.info("Notifications not available: \(error.localizedDescription)")
             } else {
                 log.info("Notification permission: \(granted ? "granted" : "denied")")
             }

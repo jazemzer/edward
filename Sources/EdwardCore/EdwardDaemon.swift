@@ -40,6 +40,9 @@ public final class EdwardDaemon {
     /// Callback fired when session finalization completes (diarized transcript + summary)
     public var onSessionComplete: ((SessionResult) -> Void)?
 
+    /// Callback fired immediately when session finalization begins (provides session metadata)
+    public var onSessionFinalizing: ((SessionInfo) -> Void)?
+
     public init(config: EdwardConfig = .default) {
         self.config = config
         self.configHash = config.configHash
@@ -152,26 +155,31 @@ public final class EdwardDaemon {
         silenceTimer?.cancel()
         silenceTimer = nil
 
-        for pipeline in pipelines {
-            pipeline.sessionRecorder = nil
-            pipeline.stop()
-        }
+        let pipelinesToFlush = pipelines
+        let recorder = sessionRecorder
+        sessionRecorder = nil
+        isRunning = false
 
-        // Finalize session recording
-        if let sessionInfo = sessionRecorder?.stop() {
-            sessionRecorder = nil
-            let finalizer = SessionFinalizer(config: config)
-            Task {
+        Task {
+            // Flush all pipelines and await pending transcriptions
+            for pipeline in pipelinesToFlush {
+                pipeline.sessionRecorder = nil
+                await pipeline.stopAndFlush()
+            }
+
+            // Finalize session recording after all transcriptions are saved
+            if let sessionInfo = recorder?.stop() {
+                self.onSessionFinalizing?(sessionInfo)
+                let finalizer = SessionFinalizer(config: self.config)
                 do {
-                    let result = try await finalizer.finalize(session: sessionInfo, storage: storage)
-                    onSessionComplete?(result)
+                    let result = try await finalizer.finalize(session: sessionInfo, storage: self.storage)
+                    self.onSessionComplete?(result)
                 } catch {
                     log.error("Session finalization failed: \(error)")
                 }
             }
         }
 
-        isRunning = false
         log.info("Edward daemon stopped")
     }
 
@@ -180,6 +188,11 @@ public final class EdwardDaemon {
         stop()
         try? speakerTracker.save()
         storage.close()
+    }
+
+    /// Whether a session is currently being recorded
+    public var hasActiveSession: Bool {
+        sessionRecorder != nil
     }
 
     /// Active source labels

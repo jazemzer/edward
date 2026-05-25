@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 #if canImport(SQLite3)
 import SQLite3
 #endif
@@ -839,5 +840,63 @@ extension Storage {
             return "\(sessionPath)/audio.raw"
         }
         return sessionPath
+    }
+
+    /// Resolve the playback audio file path (ALAC .m4a in folder, or legacy)
+    public static func playbackFilePath(for sessionPath: String) -> String {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: sessionPath, isDirectory: &isDir), isDir.boolValue {
+            return "\(sessionPath)/audio.m4a"
+        }
+        return (sessionPath as NSString).deletingPathExtension + ".m4a"
+    }
+
+    /// Convert raw Float32 PCM to ALAC (.m4a) on disk using AVFoundation
+    public static func convertRawToALAC(rawPath: String, outputPath: String, sampleRate: Int) throws {
+        let rawData = try Data(contentsOf: URL(fileURLWithPath: rawPath))
+        let sampleCount = rawData.count / MemoryLayout<Float>.size
+
+        let inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(sampleRate), channels: 1, interleaved: false)!
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(sampleCount)) else {
+            throw EdwardError.storageError("Cannot create audio buffer")
+        }
+        buffer.frameLength = AVAudioFrameCount(sampleCount)
+
+        rawData.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            let dst = buffer.floatChannelData![0]
+            for i in 0..<sampleCount {
+                dst[i] = src[i]
+            }
+        }
+
+        let outputURL = URL(fileURLWithPath: outputPath)
+        let outputSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatAppleLossless,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitDepthHintKey: 16
+        ]
+        let outputFile = try AVAudioFile(forWriting: outputURL, settings: outputSettings)
+        try outputFile.write(from: buffer)
+    }
+
+    /// Load audio from any supported format (raw PCM, or AVAudioFile-compatible like .m4a/.wav/.flac)
+    public static func loadAudioFromFile(path: String, sampleRate: Int) throws -> [Float] {
+        let url = URL(fileURLWithPath: path)
+        let ext = url.pathExtension.lowercased()
+
+        if ext == "raw" {
+            return try loadAudio(path: path)
+        }
+
+        let file = try AVAudioFile(forReading: url)
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(sampleRate), channels: 1, interleaved: false)!
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(file.length)) else {
+            throw EdwardError.storageError("Cannot create read buffer")
+        }
+        try file.read(into: buffer)
+        let floatPtr = buffer.floatChannelData![0]
+        return Array(UnsafeBufferPointer(start: floatPtr, count: Int(buffer.frameLength)))
     }
 }

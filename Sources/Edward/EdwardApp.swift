@@ -73,9 +73,6 @@ struct MainWindowView: View {
                 .background(Color(nsColor: .controlBackgroundColor))
             }
         }
-        .sheet(isPresented: $viewModel.showSessionSummary) {
-            SessionSummaryView(result: viewModel.sessionResult, isPresented: $viewModel.showSessionSummary)
-        }
         .onAppear {
             NSApplication.shared.activate(ignoringOtherApps: true)
         }
@@ -86,7 +83,6 @@ struct MainWindowView: View {
 
 struct ControlBarView: View {
     @ObservedObject var viewModel: EdwardViewModel
-    @State private var showSettings = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -103,7 +99,7 @@ struct ControlBarView: View {
                 Spacer()
 
                 // Settings button
-                Button(action: { showSettings = true }) {
+                Button(action: { SettingsWindowController.shared.show(viewModel: viewModel) }) {
                     Image(systemName: "gear")
                 }
                 .buttonStyle(.plain)
@@ -115,7 +111,7 @@ struct ControlBarView: View {
                         .foregroundColor(viewModel.showCopilot ? .yellow : .primary)
                 }
                 .buttonStyle(.plain)
-                .disabled(!viewModel.isRunning)
+                .disabled(!viewModel.isRunning && !viewModel.showCopilot)
                 .help("Toggle AI Copilot panel")
 
                 // Start/Stop button
@@ -157,9 +153,6 @@ struct ControlBarView: View {
         }
         .padding()
         .background(Color(nsColor: .windowBackgroundColor))
-        .sheet(isPresented: $showSettings) {
-            SettingsDialogView(viewModel: viewModel, isPresented: $showSettings)
-        }
     }
 }
 
@@ -281,9 +274,15 @@ class EdwardViewModel: ObservableObject {
     @Published var enableMicCapture: Bool = true
     @Published var enableSystemAudioCapture: Bool = true
     @Published var systemAudioApps: [SystemAudioApp] = SystemAudioApp.defaults
+    @Published var mergeWindow: Double = UserDefaults.standard.object(forKey: "mergeWindow") as? Double ?? EdwardConfig.default.mergeWindow {
+        didSet {
+            UserDefaults.standard.set(mergeWindow, forKey: "mergeWindow")
+        }
+    }
     @Published var sessionResult: SessionResult?
     @Published var showSessionSummary = false
     @Published var sessions: [SessionRecord] = []
+    @Published var finalizingSessionPath: String?
     @Published var retranscribingSessionId: Int64?
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled {
         didSet {
@@ -318,8 +317,28 @@ class EdwardViewModel: ObservableObject {
             UserDefaults.standard.set(ollamaBaseURL, forKey: "ollamaBaseURL")
         }
     }
+    @Published var copilotSystemPrompt: String = UserDefaults.standard.string(forKey: "copilotSystemPrompt") ?? CopilotEngine.defaultSystemPrompt {
+        didSet {
+            UserDefaults.standard.set(copilotSystemPrompt, forKey: "copilotSystemPrompt")
+            copilotEngine?.systemPrompt = copilotSystemPrompt
+        }
+    }
+    @Published var copilotUserPromptPrefix: String = UserDefaults.standard.string(forKey: "copilotUserPromptPrefix") ?? CopilotEngine.defaultUserPromptPrefix {
+        didSet {
+            UserDefaults.standard.set(copilotUserPromptPrefix, forKey: "copilotUserPromptPrefix")
+            copilotEngine?.userPromptPrefix = copilotUserPromptPrefix
+        }
+    }
+    @Published var copilotEnabled: Bool = UserDefaults.standard.object(forKey: "copilotEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(copilotEnabled, forKey: "copilotEnabled")
+            copilotEngine?.isEnabled = copilotEnabled
+        }
+    }
     @Published var availableOllamaModels: [String] = []
     @Published var showCopilot: Bool = false
+
+    @Published var isModelsLoaded = false
 
     private var daemon: EdwardDaemon?
     private(set) var copilotEngine: CopilotEngine?
@@ -345,9 +364,96 @@ class EdwardViewModel: ObservableObject {
             sessions = pastSessions
         }
 
+        // Pre-load models on launch
+        Task { await preloadModels() }
+
         // Auto-start listening if preference is set
         if startOnLaunch {
             Task { await start() }
+        }
+    }
+
+    func preloadModels() async {
+        guard daemon == nil else { return }
+        isLoading = true
+        statusText = "Loading models..."
+
+        var config = EdwardConfig.load()
+        config.languages = Array(selectedLanguages)
+        config.enableMicCapture = enableMicCapture
+        config.enableSystemAudioCapture = enableSystemAudioCapture
+        config.systemAudioApps = systemAudioApps
+        config.mergeWindow = mergeWindow
+        config.dataDir = dataDir
+
+        let d = EdwardDaemon(config: config)
+        self.daemon = d
+
+        d.onTranscription = { [weak self] entry in
+            Task { @MainActor in
+                self?.partialText = nil
+                self?.transcripts.append(entry)
+                if (self?.transcripts.count ?? 0) > 200 {
+                    self?.transcripts.removeFirst()
+                }
+                self?.copilotEngine?.addTranscript(text: entry.text, timestamp: entry.timestamp)
+            }
+        }
+
+        d.onPartialTranscription = { [weak self] text in
+            Task { @MainActor in
+                self?.partialText = text
+                self?.copilotEngine?.updatePartialTranscription(text)
+            }
+        }
+
+        d.onWordTimestampsReady = { [weak self] entryId, timestamps in
+            Task { @MainActor in
+                if let idx = self?.transcripts.firstIndex(where: { $0.id == entryId }) {
+                    self?.transcripts[idx].wordTimestamps = timestamps
+                }
+            }
+        }
+
+        d.onSessionFinalizing = { [weak self] sessionInfo in
+            Task { @MainActor in
+                let placeholder = SessionRecord(
+                    id: -1,
+                    startTime: sessionInfo.startTime,
+                    endTime: sessionInfo.endTime,
+                    duration: sessionInfo.duration,
+                    audioPath: sessionInfo.path,
+                    numSpeakers: nil,
+                    transcriptText: nil,
+                    summary: nil,
+                    modelUsed: nil
+                )
+                self?.sessions.insert(placeholder, at: 0)
+                self?.finalizingSessionPath = sessionInfo.path
+                self?.isFinalizingSession = true
+            }
+        }
+
+        d.onSessionComplete = { [weak self] result in
+            Task { @MainActor in
+                self?.isFinalizingSession = false
+                self?.finalizingSessionPath = nil
+                self?.statusText = "Ready"
+                self?.sessionResult = result
+                self?.loadSessions()
+            }
+        }
+
+        do {
+            try await d.initialize()
+            isModelsLoaded = true
+            isLoading = false
+            statusText = "Ready"
+        } catch {
+            isLoading = false
+            statusText = "Error loading models"
+            errorMessage = error.localizedDescription
+            self.daemon = nil
         }
     }
 
@@ -383,71 +489,31 @@ class EdwardViewModel: ObservableObject {
     }
 
     func start() async {
-        isLoading = true
-        statusText = "Loading models..."
         errorMessage = nil
 
+        // If models aren't loaded yet, wait for preload to finish
+        if !isModelsLoaded {
+            isLoading = true
+            statusText = "Loading models..."
+            await preloadModels()
+            guard isModelsLoaded else { return }
+        }
+
+        // Recreate daemon if config changed
         var config = EdwardConfig.load()
         config.languages = Array(selectedLanguages)
         config.enableMicCapture = enableMicCapture
         config.enableSystemAudioCapture = enableSystemAudioCapture
         config.systemAudioApps = systemAudioApps
+        config.mergeWindow = mergeWindow
         config.dataDir = dataDir
 
-        // Recreate daemon if config changed
         if let existing = daemon, existing.configHash != config.configHash {
             existing.shutdown()
             daemon = nil
-        }
-
-        // Reuse existing daemon if already initialized
-        if daemon == nil {
-            let d = EdwardDaemon(config: config)
-            self.daemon = d
-
-            d.onTranscription = { [weak self] entry in
-                Task { @MainActor in
-                    self?.partialText = nil
-                    self?.transcripts.append(entry)
-                    if (self?.transcripts.count ?? 0) > 200 {
-                        self?.transcripts.removeFirst()
-                    }
-                    self?.copilotEngine?.addTranscript(text: entry.text, timestamp: entry.timestamp)
-                }
-            }
-
-            d.onPartialTranscription = { [weak self] text in
-                Task { @MainActor in
-                    self?.partialText = text
-                }
-            }
-
-            d.onWordTimestampsReady = { [weak self] entryId, timestamps in
-                Task { @MainActor in
-                    if let idx = self?.transcripts.firstIndex(where: { $0.id == entryId }) {
-                        self?.transcripts[idx].wordTimestamps = timestamps
-                    }
-                }
-            }
-
-            d.onSessionComplete = { [weak self] result in
-                Task { @MainActor in
-                    self?.sessionResult = result
-                    self?.showSessionSummary = true
-                    self?.loadSessions()
-                }
-            }
-
-            do {
-                try await d.initialize()
-            } catch {
-                isLoading = false
-                isRunning = false
-                statusText = "Error"
-                errorMessage = error.localizedDescription
-                self.daemon = nil
-                return
-            }
+            isModelsLoaded = false
+            await preloadModels()
+            guard isModelsLoaded else { return }
         }
 
         do {
@@ -458,21 +524,24 @@ class EdwardViewModel: ObservableObject {
             statusText = "Listening (\(languageSummary)) — \(sources)"
 
             // Start copilot engine
+            copilotEngine?.reset()
             let engine = CopilotEngine(model: ollamaModel, baseURL: ollamaBaseURL)
+            engine.systemPrompt = copilotSystemPrompt
+            engine.userPromptPrefix = copilotUserPromptPrefix
+            engine.isEnabled = copilotEnabled
             self.copilotEngine = engine
             engine.start()
 
             // Check for failed sources after system audio pipelines have had time to start
             let d = daemon!
             Task {
-                try? await Task.sleep(nanoseconds: 3_000_000_000) // 3s
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
                 await MainActor.run {
                     let failed = d.failedSources
                     if !failed.isEmpty {
                         let msgs = failed.map { "\($0.label): \($0.error)" }
                         self.errorMessage = msgs.joined(separator: "\n")
                     }
-                    // Refresh active sources
                     let active = d.activeSources
                     if !active.isEmpty {
                         self.statusText = "Listening (\(self.languageSummary)) — \(active.joined(separator: " + "))"
@@ -488,17 +557,27 @@ class EdwardViewModel: ObservableObject {
     }
 
     func stop() {
+        let hadSessionRecording = daemon?.hasActiveSession ?? false
         daemon?.stop()
         copilotEngine?.stop()
         isRunning = false
         partialText = nil
-        statusText = "Stopped"
+
+        if hadSessionRecording {
+            isFinalizingSession = true
+            statusText = "Finalizing session..."
+        } else {
+            statusText = "Stopped"
+        }
     }
 
     func toggleCopilot() {
         guard let engine = copilotEngine else { return }
         if copilotOverlay == nil {
             copilotOverlay = CopilotOverlayController(engine: engine)
+            copilotOverlay?.onClose = { [weak self] in
+                self?.showCopilot = false
+            }
         }
         copilotOverlay?.toggle()
         showCopilot = copilotOverlay?.isVisible ?? false
@@ -797,23 +876,45 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
+final class SettingsWindowController {
+    static let shared = SettingsWindowController()
+    private var window: NSWindow?
+
+    func show(viewModel: EdwardViewModel) {
+        if let window = window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let content = SettingsDialogView(viewModel: viewModel, onClose: { [weak self] in
+            self?.window?.close()
+        })
+        let hostingView = NSHostingView(rootView: content)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 550),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Settings"
+        window.contentView = hostingView
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        self.window = window
+    }
+}
+
 struct SettingsDialogView: View {
     @ObservedObject var viewModel: EdwardViewModel
-    @Binding var isPresented: Bool
+    var onClose: (() -> Void)?
     @State private var selectedCategory: SettingsCategory = .general
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("Settings")
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                Spacer()
-                Button("Done") { isPresented = false }
-                    .keyboardShortcut(.defaultAction)
-            }
-            .padding()
-
             Divider()
 
             HSplitView {
@@ -843,7 +944,6 @@ struct SettingsDialogView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(width: 550, height: 420)
     }
 }
 
@@ -921,6 +1021,20 @@ struct SettingsAudioSourcesPane: View {
                     }
                 }
             }
+
+            Section("Transcription") {
+                HStack {
+                    Text("Commit delay")
+                        .frame(width: 100, alignment: .leading)
+                    Slider(value: $viewModel.mergeWindow, in: 0.2...3.0, step: 0.1)
+                    Text("\(viewModel.mergeWindow, specifier: "%.1f")s")
+                        .frame(width: 35)
+                        .font(.caption)
+                }
+                Text("How long to wait after speech pauses before finalizing. Lower = faster but more fragmented.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
         .formStyle(.grouped)
     }
@@ -972,6 +1086,30 @@ struct SettingsAIPane: View {
 
                 Button("Test Connection") {
                     testConnection()
+                }
+                .font(.caption)
+            }
+
+            Section("Copilot") {
+                Toggle("Enable AI Copilot", isOn: $viewModel.copilotEnabled)
+
+                Text("System Prompt")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextEditor(text: $viewModel.copilotSystemPrompt)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(height: 120)
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
+
+                Text("User Prompt Prefix (transcript is appended after this)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField("Prefix before transcript", text: $viewModel.copilotUserPromptPrefix)
+                    .textFieldStyle(.roundedBorder)
+
+                Button("Reset to Defaults") {
+                    viewModel.copilotSystemPrompt = CopilotEngine.defaultSystemPrompt
+                    viewModel.copilotUserPromptPrefix = CopilotEngine.defaultUserPromptPrefix
                 }
                 .font(.caption)
             }
@@ -1223,8 +1361,9 @@ struct SessionsListView: View {
             GeometryReader { geo in
                 HStack(spacing: 0) {
                     // Session list
-                    List(viewModel.sessions, selection: $selectedSessionId) { session in
-                        SessionRowView(session: session)
+                    VStack(spacing: 0) {
+                        List(viewModel.sessions, selection: $selectedSessionId) { session in
+                        SessionRowView(session: session, isFinalizing: viewModel.finalizingSessionPath == session.audioPath)
                             .tag(session.id)
                             .popover(isPresented: Binding(
                                 get: { renamingSession?.id == session.id },
@@ -1294,6 +1433,7 @@ struct SessionsListView: View {
                             }
                     }
                     .listStyle(.sidebar)
+                    }
                     .frame(width: geo.size.width * 0.25)
                     .clipped()
 
@@ -1364,6 +1504,7 @@ struct RenamePopover: View {
 
 struct SessionRowView: View {
     let session: SessionRecord
+    var isFinalizing: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1372,9 +1513,17 @@ struct SessionRowView: View {
                 .fontWeight(.medium)
                 .lineLimit(1)
             HStack(spacing: 6) {
-                Label(session.durationString, systemImage: "clock")
-                if let speakers = session.numSpeakers {
-                    Label("\(speakers)", systemImage: "person.2")
+                if isFinalizing {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Finalizing...")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else {
+                    Label(session.durationString, systemImage: "clock")
+                    if let speakers = session.numSpeakers {
+                        Label("\(speakers)", systemImage: "person.2")
+                    }
                 }
             }
             .font(.caption2)
@@ -1412,15 +1561,14 @@ class SessionAudioPlayer: ObservableObject {
         isPlaying = false
         currentTime = 0
 
-        let audioPath = Storage.audioFilePath(for: sessionPath)
-        guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: audioPath)) else {
+        let audioPath = Storage.playbackFilePath(for: sessionPath)
+        guard FileManager.default.fileExists(atPath: audioPath) else {
             isLoaded = false
             return
         }
 
-        let wavData = createWAVData(from: rawData, sampleRate: sampleRate)
         do {
-            player = try AVAudioPlayer(data: wavData)
+            player = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: audioPath))
             player?.prepareToPlay()
             duration = player?.duration ?? 0
             isLoaded = true
@@ -1463,38 +1611,16 @@ class SessionAudioPlayer: ObservableObject {
             }
         }
     }
-
-    private func createWAVData(from rawPCM: Data, sampleRate: Int) -> Data {
-        let numChannels: UInt16 = 1
-        let bitsPerSample: UInt16 = 32
-        let byteRate = UInt32(sampleRate) * UInt32(numChannels) * UInt32(bitsPerSample / 8)
-        let blockAlign = numChannels * (bitsPerSample / 8)
-        let dataSize = UInt32(rawPCM.count)
-        let fileSize = 36 + dataSize
-
-        var header = Data(capacity: 44)
-        header.append(contentsOf: "RIFF".utf8)
-        header.append(withUnsafeBytes(of: fileSize.littleEndian) { Data($0) })
-        header.append(contentsOf: "WAVE".utf8)
-        header.append(contentsOf: "fmt ".utf8)
-        header.append(withUnsafeBytes(of: UInt32(16).littleEndian) { Data($0) }) // chunk size
-        header.append(withUnsafeBytes(of: UInt16(3).littleEndian) { Data($0) })  // IEEE float
-        header.append(withUnsafeBytes(of: numChannels.littleEndian) { Data($0) })
-        header.append(withUnsafeBytes(of: UInt32(sampleRate).littleEndian) { Data($0) })
-        header.append(withUnsafeBytes(of: byteRate.littleEndian) { Data($0) })
-        header.append(withUnsafeBytes(of: blockAlign.littleEndian) { Data($0) })
-        header.append(withUnsafeBytes(of: bitsPerSample.littleEndian) { Data($0) })
-        header.append(contentsOf: "data".utf8)
-        header.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
-        header.append(rawPCM)
-        return header
-    }
 }
 
 struct SessionDetailView: View {
     let session: SessionRecord
     @ObservedObject var viewModel: EdwardViewModel
     @StateObject private var player = SessionAudioPlayer()
+
+    private var isFinalizing: Bool {
+        viewModel.finalizingSessionPath == session.audioPath
+    }
 
     var body: some View {
         ScrollView {
@@ -1522,11 +1648,28 @@ struct SessionDetailView: View {
                             .foregroundColor(.secondary)
                     }
                     Spacer()
-                    Button(action: { viewModel.generateSessionSummary(session) }) {
-                        Label("Summarize", systemImage: "sparkles")
+                    if !isFinalizing {
+                        Button(action: { viewModel.generateSessionSummary(session) }) {
+                            Label("Summarize", systemImage: "sparkles")
+                        }
+                        .disabled(session.transcriptText == nil)
                     }
-                    .disabled(session.transcriptText == nil)
                 }
+
+                if isFinalizing {
+                    Divider()
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text("Finalizing session...")
+                            .font(.headline)
+                        Text("Diarizing speakers and generating transcript")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 40)
+                } else {
 
                 // Audio player controls
                 if player.isLoaded {
@@ -1584,6 +1727,7 @@ struct SessionDetailView: View {
                         .font(.system(.body, design: .monospaced))
                         .textSelection(.enabled)
                 }
+                } // end else (not finalizing)
             }
             .padding()
         }
