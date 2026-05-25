@@ -15,6 +15,11 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCS
     private let targetSampleRate: Double = 16000
     private var hasReceivedAudio = false
 
+    /// Error message if the source failed to start
+    public var lastError: String?
+
+    private var muted = true
+
     public init(bundleId: String, label: String) {
         self.bundleId = bundleId
         self.sourceId = "system:\(label.lowercased())"
@@ -24,8 +29,16 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCS
 
     public func start(onSamples: @escaping ([Float]) -> Void) throws {
         self.onSamples = onSamples
+        muted = false
 
-        // Start capture asynchronously but log all errors
+        // Stream already running — just unmute
+        if stream != nil {
+            isRunning = true
+            log.info("[\(sourceId)] Resumed (unmuted)")
+            return
+        }
+
+        // First start — create the stream
         Task {
             do {
                 try await startCapture()
@@ -39,19 +52,27 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCS
 
     public func stop() {
         guard isRunning else { return }
-        Task {
-            try? await stream?.stopCapture()
-        }
-        stream = nil
+        // Don't stop the stream — just mute so we avoid re-triggering permissions
+        muted = true
         isRunning = false
-        converter = nil
         hasReceivedAudio = false
-        log.info("[\(sourceId)] System audio capture stopped")
+        log.info("[\(sourceId)] System audio capture muted")
     }
 
     // MARK: - Private
 
     private func startCapture() async throws {
+        // Check if screen recording permission is granted, request if not yet determined
+        if !CGPreflightScreenCaptureAccess() {
+            // This triggers the system permission prompt on first call
+            let granted = CGRequestScreenCaptureAccess()
+            if !granted {
+                log.info("[\(sourceId)] Screen recording permission not granted, skipping system audio capture")
+                lastError = "Screen recording permission not granted"
+                return
+            }
+        }
+
         log.info("[\(sourceId)] Requesting shareable content...")
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
@@ -59,8 +80,7 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCS
 
         guard let app = content.applications.first(where: { $0.bundleIdentifier == bundleId }) else {
             log.info("[\(sourceId)] App not running: \(bundleId)")
-            print("[\(sourceId)] App not running: \(bundleId)")
-            fflush(stdout)
+            lastError = "\(sourceLabel) not running"
             return
         }
 
@@ -94,6 +114,7 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCS
         try await stream.startCapture()
         self.stream = stream
         isRunning = true
+        lastError = nil
         log.info("[\(sourceId)] System audio capture started for \(app.applicationName)")
         print("[\(sourceId)] Capturing audio from \(app.applicationName)")
         fflush(stdout)
@@ -111,7 +132,7 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCS
     // MARK: - SCStreamOutput
 
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio else { return }
+        guard type == .audio, !muted else { return }
         guard CMSampleBufferGetNumSamples(sampleBuffer) > 0 else { return }
         guard let formatDesc = sampleBuffer.formatDescription else { return }
 

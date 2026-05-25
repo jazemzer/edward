@@ -13,6 +13,7 @@ public final class EdwardDaemon {
     private var pipelines: [AudioPipeline] = []
     private var captureStartTime: Date?
     private var isRunning = false
+    public let configHash: Int
 
     // Auto-diarization state
     private var lastSpeechTime: Date?
@@ -36,6 +37,7 @@ public final class EdwardDaemon {
 
     public init(config: EdwardConfig = .default) {
         self.config = config
+        self.configHash = config.configHash
         self.transcriber = Transcriber(config: config)
         self.speakerTracker = SpeakerTracker(config: config)
         self.forcedAligner = ForcedAlignerWrapper()
@@ -132,7 +134,7 @@ public final class EdwardDaemon {
         log.info("Edward daemon started — \(pipelines.count) pipeline(s) listening...")
     }
 
-    /// Stop the daemon
+    /// Stop the daemon — pauses pipelines but keeps resources alive for restart
     public func stop() {
         guard isRunning else { return }
 
@@ -143,17 +145,31 @@ public final class EdwardDaemon {
             pipeline.stop()
         }
 
+        isRunning = false
+        log.info("Edward daemon stopped")
+    }
+
+    /// Fully shut down the daemon — releases all resources
+    public func shutdown() {
+        stop()
         socketServer.stop()
         try? speakerTracker.save()
         storage.close()
-
-        isRunning = false
-        log.info("Edward daemon stopped")
     }
 
     /// Active source labels
     public var activeSources: [String] {
         pipelines.filter { $0.source.isRunning }.map { $0.source.sourceLabel }
+    }
+
+    /// Sources that failed to start, with error messages
+    public var failedSources: [(label: String, error: String)] {
+        pipelines.compactMap { pipeline in
+            if let sys = pipeline.source as? SystemAudioSource, let err = sys.lastError {
+                return (label: sys.sourceLabel, error: err)
+            }
+            return nil
+        }
     }
 
     /// Status info

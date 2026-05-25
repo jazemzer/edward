@@ -94,9 +94,20 @@ struct ControlBarView: View {
             }
 
             if let error = viewModel.errorMessage {
-                Text(error)
-                    .font(.caption)
-                    .foregroundColor(.red)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                    if error.contains("Screen recording permission") {
+                        Button("Open Screen Recording Settings") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .font(.caption)
+                        .buttonStyle(.link)
+                    }
+                }
             }
 
             // Languages row
@@ -324,40 +335,77 @@ class EdwardViewModel: ObservableObject {
         config.enableSystemAudioCapture = enableSystemAudioCapture
         config.systemAudioApps = systemAudioApps
 
-        let daemon = EdwardDaemon(config: config)
-        self.daemon = daemon
-
-        daemon.onTranscription = { [weak self] entry in
-            Task { @MainActor in
-                self?.partialText = nil
-                self?.transcripts.append(entry)
-                if (self?.transcripts.count ?? 0) > 200 {
-                    self?.transcripts.removeFirst()
-                }
-            }
+        // Recreate daemon if config changed
+        if let existing = daemon, existing.configHash != config.configHash {
+            existing.shutdown()
+            daemon = nil
         }
 
-        daemon.onPartialTranscription = { [weak self] text in
-            Task { @MainActor in
-                self?.partialText = text
-            }
-        }
+        // Reuse existing daemon if already initialized
+        if daemon == nil {
+            let d = EdwardDaemon(config: config)
+            self.daemon = d
 
-        daemon.onWordTimestampsReady = { [weak self] entryId, timestamps in
-            Task { @MainActor in
-                if let idx = self?.transcripts.firstIndex(where: { $0.id == entryId }) {
-                    self?.transcripts[idx].wordTimestamps = timestamps
+            d.onTranscription = { [weak self] entry in
+                Task { @MainActor in
+                    self?.partialText = nil
+                    self?.transcripts.append(entry)
+                    if (self?.transcripts.count ?? 0) > 200 {
+                        self?.transcripts.removeFirst()
+                    }
                 }
+            }
+
+            d.onPartialTranscription = { [weak self] text in
+                Task { @MainActor in
+                    self?.partialText = text
+                }
+            }
+
+            d.onWordTimestampsReady = { [weak self] entryId, timestamps in
+                Task { @MainActor in
+                    if let idx = self?.transcripts.firstIndex(where: { $0.id == entryId }) {
+                        self?.transcripts[idx].wordTimestamps = timestamps
+                    }
+                }
+            }
+
+            do {
+                try await d.initialize()
+            } catch {
+                isLoading = false
+                isRunning = false
+                statusText = "Error"
+                errorMessage = error.localizedDescription
+                self.daemon = nil
+                return
             }
         }
 
         do {
-            try await daemon.initialize()
-            try daemon.start()
+            try daemon!.start()
             isRunning = true
             isLoading = false
-            let sources = daemon.activeSources.joined(separator: " + ")
+            let sources = daemon!.activeSources.joined(separator: " + ")
             statusText = "Listening (\(languageSummary)) — \(sources)"
+
+            // Check for failed sources after system audio pipelines have had time to start
+            let d = daemon!
+            Task {
+                try? await Task.sleep(nanoseconds: 3_000_000_000) // 3s
+                await MainActor.run {
+                    let failed = d.failedSources
+                    if !failed.isEmpty {
+                        let msgs = failed.map { "\($0.label): \($0.error)" }
+                        self.errorMessage = msgs.joined(separator: "\n")
+                    }
+                    // Refresh active sources
+                    let active = d.activeSources
+                    if !active.isEmpty {
+                        self.statusText = "Listening (\(self.languageSummary)) — \(active.joined(separator: " + "))"
+                    }
+                }
+            }
         } catch {
             isLoading = false
             isRunning = false
@@ -368,8 +416,8 @@ class EdwardViewModel: ObservableObject {
 
     func stop() {
         daemon?.stop()
-        daemon = nil
         isRunning = false
+        partialText = nil
         statusText = "Stopped"
     }
 }

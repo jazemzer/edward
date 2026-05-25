@@ -83,6 +83,23 @@ extension String {
     }
 }
 
+extension EdwardConfig {
+    /// Hash of source-related settings to detect when daemon needs recreation
+    public var configHash: Int {
+        var hasher = Hasher()
+        hasher.combine(enableMicCapture)
+        hasher.combine(enableSystemAudioCapture)
+        for app in systemAudioApps {
+            hasher.combine(app.bundleId)
+            hasher.combine(app.enabled)
+        }
+        for lang in languages.sorted() {
+            hasher.combine(lang)
+        }
+        return hasher.finalize()
+    }
+}
+
 /// App configuration for system audio capture
 public struct SystemAudioApp: Codable {
     public var bundleId: String

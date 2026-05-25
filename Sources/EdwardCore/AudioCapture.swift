@@ -19,6 +19,31 @@ public final class AudioCapture: AudioSource {
     /// Start capturing audio from the default input device
     /// `onSamples` is called on the audio thread with 16kHz mono Float32 chunks
     public func start(onSamples: @escaping ([Float]) -> Void) throws {
+        // Check mic permission without prompting
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            break
+        case .notDetermined:
+            log.info("Microphone permission not yet determined — requesting...")
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                if granted {
+                    try? self.startEngine(onSamples: onSamples)
+                } else {
+                    log.info("Microphone permission denied by user")
+                }
+            }
+            return
+        default:
+            log.info("Microphone permission not granted — grant in System Settings > Privacy > Microphone")
+            print("No microphone permission — grant in System Settings > Privacy > Microphone")
+            fflush(stdout)
+            return
+        }
+
+        try startEngine(onSamples: onSamples)
+    }
+
+    private func startEngine(onSamples: @escaping ([Float]) -> Void) throws {
         self.onSamples = onSamples
 
         let inputNode = engine.inputNode

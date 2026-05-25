@@ -19,6 +19,10 @@ public final class AudioPipeline {
     private let audioTimeoutInterval: TimeInterval = 2.0 // finalize if no audio for 2s
     private var isPartialRunning = false
 
+    /// Accumulates audio samples from the moment speech starts, so no data is lost
+    private var speechBuffer: [Float] = []
+    private var isSpeechActive = false
+
     /// Callback fired on every new transcription
     public var onTranscription: ((TranscriptEntry) -> Void)?
     /// Callback fired with partial transcription text during speech (nil = cleared)
@@ -55,6 +59,9 @@ public final class AudioPipeline {
             guard let self = self else { return }
             self.lastSampleTime = Date()
             self.ringBuffer.write(samples)
+            if self.isSpeechActive {
+                self.speechBuffer.append(contentsOf: samples)
+            }
             self.vadProcessor.process(samples: samples)
             self.sampleCounter += samples.count
         }
@@ -68,10 +75,14 @@ public final class AudioPipeline {
     public func stop() {
         partialTimer?.cancel()
         partialTimer = nil
+        partialGeneration += 1
         audioTimeoutTimer?.cancel()
         audioTimeoutTimer = nil
+        isSpeechActive = false
+        speechBuffer = []
         vadProcessor.flush()
         source.stop()
+        onPartialTranscription?(nil)
         log.info("Pipeline stopped: \(source.sourceId)")
     }
 
@@ -101,50 +112,66 @@ public final class AudioPipeline {
 
     private func handleSpeechStarted(time: Float) {
         speechStartSampleCount = sampleCounter
+        speechBuffer = []
+        isSpeechActive = true
         partialGeneration += 1
         startPartialTimer()
     }
 
     private func handleSpeechEnded(segment: AudioCommon.SpeechSegment) {
         let duration = segment.endTime - segment.startTime
-        guard Double(duration) >= config.minSpeechDuration else { return }
+        guard Double(duration) >= config.minSpeechDuration else {
+            isSpeechActive = false
+            speechBuffer = []
+            return
+        }
 
         partialTimer?.cancel()
         partialTimer = nil
         partialGeneration += 1
+        isSpeechActive = false
 
-        // Cap audio at 30 seconds to prevent ASR model from looping
-        let maxDuration = 30.0
-        let effectiveDuration = min(Double(duration), maxDuration)
-        let sampleCount = Int(effectiveDuration * Double(config.sampleRate))
-        let audio = ringBuffer.readLast(sampleCount)
-        guard !audio.isEmpty else { return }
+        // Use the dedicated speech buffer — contains all audio since speech started
+        let fullAudio = speechBuffer
+        speechBuffer = []
+        guard !fullAudio.isEmpty else { return }
 
         let sourceId = source.sourceId
+        let maxChunkSamples = 30 * config.sampleRate // 30s chunks to avoid ASR loops
+
+        // Split into chunks if longer than 30s
+        var chunks: [[Float]] = []
+        var offset = 0
+        while offset < fullAudio.count {
+            let end = min(offset + maxChunkSamples, fullAudio.count)
+            chunks.append(Array(fullAudio[offset..<end]))
+            offset = end
+        }
 
         Task {
-            do {
-                var entry = try await transcriber.transcribe(audio: audio, sampleRate: config.sampleRate)
+            for chunk in chunks {
+                do {
+                    var entry = try await transcriber.transcribe(audio: chunk, sampleRate: config.sampleRate)
 
-                // Detect and truncate repetition loops
-                let trimmed = Self.truncateRepetition(entry.text.trimmingCharacters(in: .whitespacesAndNewlines))
-                guard !trimmed.isEmpty, trimmed.count > 1 else { return }
+                    let trimmed = Self.truncateRepetition(entry.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                    guard !trimmed.isEmpty, trimmed.count > 1 else { continue }
 
-                entry = TranscriptEntry(
-                    id: entry.id, timestamp: entry.timestamp, duration: entry.duration,
-                    text: trimmed, processingTime: entry.processingTime,
-                    source: sourceId
-                )
+                    entry = TranscriptEntry(
+                        id: entry.id, timestamp: entry.timestamp, duration: entry.duration,
+                        text: trimmed, processingTime: entry.processingTime,
+                        source: sourceId
+                    )
 
-                let audioPath = try storage.saveAudio(audio, sampleRate: config.sampleRate, timestamp: entry.timestamp)
-                entry.audioPath = audioPath
+                    let audioPath = try storage.saveAudio(chunk, sampleRate: config.sampleRate, timestamp: entry.timestamp)
+                    entry.audioPath = audioPath
 
-                entry = try storage.save(entry)
+                    entry = try storage.save(entry)
 
-                onTranscription?(entry)
-                onPostTranscription?(entry, audio)
-            } catch {
-                log.error("[\(sourceId)] Transcription failed: \(error)")
+                    onTranscription?(entry)
+                    onPostTranscription?(entry, chunk)
+                } catch {
+                    log.error("[\(sourceId)] Transcription failed: \(error)")
+                }
             }
         }
     }
@@ -161,12 +188,11 @@ public final class AudioPipeline {
             guard let self = self, self.partialGeneration == gen else { return }
             // Skip if previous partial is still running
             guard !self.isPartialRunning else { return }
-            let samplesSinceSpeech = self.sampleCounter - self.speechStartSampleCount
-            guard samplesSinceSpeech > self.config.sampleRate / 2 else { return }
-            // Cap partial audio to last 10 seconds
+            guard self.speechBuffer.count > self.config.sampleRate / 2 else { return }
+            // Use the tail of the speech buffer for partials (last 10s max)
             let maxPartialSamples = self.config.sampleRate * 10
-            let samplesToRead = min(samplesSinceSpeech, maxPartialSamples)
-            let audio = self.ringBuffer.readLast(samplesToRead)
+            let startIdx = max(0, self.speechBuffer.count - maxPartialSamples)
+            let audio = Array(self.speechBuffer[startIdx...])
             guard !audio.isEmpty else { return }
             self.isPartialRunning = true
             Task {
