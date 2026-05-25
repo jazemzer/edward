@@ -68,7 +68,7 @@ public final class OfflineDiarizer {
         fflush(stdout)
 
         // Run full pipeline with config to get DiarizationResult (not just [DiarizedSegment])
-        let diarResult = pipeline!.diarize(audio: allAudio, sampleRate: config.sampleRate, config: .default)
+        let diarResult = pipeline!.diarize(audio: allAudio, sampleRate: config.sampleRate, config: DiarizationConfig(clusteringThreshold: 0.6))
 
         // Release the pipeline immediately to free VRAM
         pipeline = nil

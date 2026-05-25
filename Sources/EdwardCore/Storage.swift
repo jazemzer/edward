@@ -39,6 +39,18 @@ public final class Storage {
         );
         CREATE INDEX IF NOT EXISTS idx_transcripts_timestamp ON transcripts(timestamp);
         CREATE INDEX IF NOT EXISTS idx_transcripts_speaker ON transcripts(speaker_id);
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            duration REAL NOT NULL,
+            audio_path TEXT NOT NULL,
+            num_speakers INTEGER,
+            transcript_text TEXT,
+            summary TEXT,
+            model_used TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_time);
         """
         var errMsg: UnsafeMutablePointer<CChar>?
         let execRc = sqlite3_exec(db, sql, nil, nil, &errMsg)
@@ -167,9 +179,6 @@ public final class Storage {
             updated.id = sqlite3_last_insert_rowid(db)
         }
 
-        // Append to daily file
-        appendToDailyFile(entry)
-
         return updated
     }
 
@@ -231,6 +240,158 @@ public final class Storage {
         }
     }
 
+    /// Delete a transcript entry and its associated audio file
+    public func deleteTranscript(id: Int64) throws {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        // First, get the audio path so we can delete the file
+        var audioPath: String?
+        let selectSql = "SELECT audio_path FROM transcripts WHERE id = ?;"
+        var selectStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(selectStmt, 1, id)
+            if sqlite3_step(selectStmt) == SQLITE_ROW, sqlite3_column_type(selectStmt, 0) != SQLITE_NULL {
+                audioPath = String(cString: sqlite3_column_text(selectStmt, 0))
+            }
+        }
+        sqlite3_finalize(selectStmt)
+
+        // Delete the database row
+        try queue.sync {
+            let sql = "DELETE FROM transcripts WHERE id = ?;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw EdwardError.storageError("Cannot prepare delete: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw EdwardError.storageError("Cannot delete: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        // Delete the audio file if it exists
+        if let path = audioPath {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+
+        log.info("Deleted transcript \(id)")
+    }
+
+    /// Rename a session's audio file and update the database path
+    public func renameSession(id: Int64, newName: String) throws -> String {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        // Get current audio path
+        let selectSql = "SELECT audio_path FROM sessions WHERE id = ?;"
+        var selectStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
+            throw EdwardError.storageError("Cannot prepare select")
+        }
+        defer { sqlite3_finalize(selectStmt) }
+        sqlite3_bind_int64(selectStmt, 1, id)
+
+        guard sqlite3_step(selectStmt) == SQLITE_ROW else {
+            throw EdwardError.storageError("Session not found")
+        }
+        let currentPath = String(cString: sqlite3_column_text(selectStmt, 0))
+
+        let fm = FileManager.default
+        let dir = (currentPath as NSString).deletingLastPathComponent
+        let sanitized = newName.replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        var isDir: ObjCBool = false
+        let newPath: String
+        if fm.fileExists(atPath: currentPath, isDirectory: &isDir), isDir.boolValue {
+            newPath = "\(dir)/\(sanitized)"
+        } else {
+            let ext = (currentPath as NSString).pathExtension
+            newPath = "\(dir)/\(sanitized).\(ext)"
+        }
+
+        // Rename the audio file
+        if fm.fileExists(atPath: currentPath) {
+            try fm.moveItem(atPath: currentPath, toPath: newPath)
+        }
+
+        // Update database
+        try queue.sync {
+            let sql = "UPDATE sessions SET audio_path = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw EdwardError.storageError("Cannot prepare update: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, (newPath as NSString).utf8String, -1, nil)
+            sqlite3_bind_int64(stmt, 2, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw EdwardError.storageError("Cannot update: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        log.info("Renamed session \(id) to \(newPath)")
+        return newPath
+    }
+
+    /// Delete a session and its audio file
+    public func deleteSession(id: Int64) throws {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        // Get audio path
+        var audioPath: String?
+        let selectSql = "SELECT audio_path FROM sessions WHERE id = ?;"
+        var selectStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(selectStmt, 1, id)
+            if sqlite3_step(selectStmt) == SQLITE_ROW {
+                audioPath = String(cString: sqlite3_column_text(selectStmt, 0))
+            }
+        }
+        sqlite3_finalize(selectStmt)
+
+        // Delete database row
+        try queue.sync {
+            let sql = "DELETE FROM sessions WHERE id = ?;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw EdwardError.storageError("Cannot prepare delete: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw EdwardError.storageError("Cannot delete: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        // Delete audio file
+        if let path = audioPath {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+
+        log.info("Deleted session \(id)")
+    }
+
+    /// Update a session's summary
+    public func updateSessionSummary(id: Int64, summary: String) throws {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        try queue.sync {
+            let sql = "UPDATE sessions SET summary = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw EdwardError.storageError("Cannot prepare update: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, (summary as NSString).utf8String, -1, nil)
+            sqlite3_bind_int64(stmt, 2, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw EdwardError.storageError("Cannot update: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        log.info("Updated summary for session \(id)")
+    }
+
     /// Save raw audio segment to disk. Returns the file path.
     public func saveAudio(_ audio: [Float], sampleRate: Int, timestamp: Date) throws -> String {
         let audioDir = "\(config.dataDir)/audio"
@@ -248,9 +409,14 @@ public final class Storage {
         return path
     }
 
-    /// Load raw audio from a saved file
+    /// Load raw audio from a saved file or session folder
     public static func loadAudio(path: String) throws -> [Float] {
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        var audioPath = path
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
+            audioPath = "\(path)/audio.raw"
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: audioPath))
         return data.withUnsafeBytes { raw in
             let buffer = raw.bindMemory(to: Float.self)
             return Array(buffer)
@@ -308,6 +474,55 @@ public final class Storage {
         }
     }
 
+    /// Delete all transcript entries between two timestamps (for retranscription)
+    public func deleteEntriesBetween(start: Date, end: Date) throws {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        let formatter = ISO8601DateFormatter()
+        let startStr = formatter.string(from: start)
+        let endStr = formatter.string(from: end)
+
+        try queue.sync {
+            let sql = "DELETE FROM transcripts WHERE timestamp >= ? AND timestamp <= ?;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw EdwardError.storageError("Cannot prepare delete: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_text(stmt, 1, (startStr as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, (endStr as NSString).utf8String, -1, nil)
+
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw EdwardError.storageError("Cannot delete: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        log.info("Deleted transcript entries between \(startStr) and \(endStr)")
+    }
+
+    /// Update a session's transcript text and speaker count
+    public func updateSessionTranscript(id: Int64, transcriptText: String, numSpeakers: Int) throws {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        try queue.sync {
+            let sql = "UPDATE sessions SET transcript_text = ?, num_speakers = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw EdwardError.storageError("Cannot prepare update: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, (transcriptText as NSString).utf8String, -1, nil)
+            sqlite3_bind_int(stmt, 2, Int32(numSpeakers))
+            sqlite3_bind_int64(stmt, 3, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw EdwardError.storageError("Cannot update: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        log.info("Updated transcript for session \(id)")
+    }
+
     /// Get all entries that have audio files (for offline diarization)
     public func entriesWithAudio(date: Date? = nil) throws -> [TranscriptEntry] {
         guard let db = db else { throw EdwardError.storageError("Database not open") }
@@ -329,6 +544,117 @@ public final class Storage {
         defer { sqlite3_finalize(stmt) }
 
         return parseRowsWithAudio(stmt)
+    }
+
+    /// Get all entries between two timestamps (for session finalization)
+    public func entriesBetween(start: Date, end: Date) throws -> [TranscriptEntry] {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        let formatter = ISO8601DateFormatter()
+        let startStr = formatter.string(from: start)
+        let endStr = formatter.string(from: end)
+
+        let sql = "SELECT id, timestamp, duration, text, processing_time, speaker_id, speaker_name, speaker_confidence, audio_path, word_timestamps, source FROM transcripts WHERE timestamp >= ? AND timestamp <= ? ORDER BY id;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw EdwardError.storageError("Cannot prepare query")
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (startStr as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 2, (endStr as NSString).utf8String, -1, nil)
+
+        return parseRowsWithAudio(stmt)
+    }
+
+    /// Save a session record to the database. Returns the session ID.
+    @discardableResult
+    public func saveSession(startTime: Date, endTime: Date, duration: Double, audioPath: String, numSpeakers: Int, transcriptText: String?, summary: String?, modelUsed: String?) throws -> Int64 {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        let formatter = ISO8601DateFormatter()
+        let startStr = formatter.string(from: startTime)
+        let endStr = formatter.string(from: endTime)
+
+        var sessionId: Int64 = 0
+        try queue.sync {
+            let sql = "INSERT INTO sessions (start_time, end_time, duration, audio_path, num_speakers, transcript_text, summary, model_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?);"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw EdwardError.storageError("Cannot prepare session insert: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_text(stmt, 1, (startStr as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, (endStr as NSString).utf8String, -1, nil)
+            sqlite3_bind_double(stmt, 3, duration)
+            sqlite3_bind_text(stmt, 4, (audioPath as NSString).utf8String, -1, nil)
+            sqlite3_bind_int(stmt, 5, Int32(numSpeakers))
+            if let text = transcriptText {
+                sqlite3_bind_text(stmt, 6, (text as NSString).utf8String, -1, nil)
+            } else {
+                sqlite3_bind_null(stmt, 6)
+            }
+            if let sum = summary {
+                sqlite3_bind_text(stmt, 7, (sum as NSString).utf8String, -1, nil)
+            } else {
+                sqlite3_bind_null(stmt, 7)
+            }
+            if let model = modelUsed {
+                sqlite3_bind_text(stmt, 8, (model as NSString).utf8String, -1, nil)
+            } else {
+                sqlite3_bind_null(stmt, 8)
+            }
+
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw EdwardError.storageError("Cannot insert session: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            sessionId = sqlite3_last_insert_rowid(db)
+        }
+
+        return sessionId
+    }
+
+    /// Query recent sessions
+    public func recentSessions(limit: Int = 20) throws -> [SessionRecord] {
+        guard let db = db else { throw EdwardError.storageError("Database not open") }
+
+        let sql = "SELECT id, start_time, end_time, duration, audio_path, num_speakers, transcript_text, summary, model_used FROM sessions ORDER BY id DESC LIMIT ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw EdwardError.storageError("Cannot prepare sessions query")
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int(stmt, 1, Int32(limit))
+
+        let formatter = ISO8601DateFormatter()
+        var results: [SessionRecord] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let startStr = String(cString: sqlite3_column_text(stmt, 1))
+            let endStr = String(cString: sqlite3_column_text(stmt, 2))
+            let duration = sqlite3_column_double(stmt, 3)
+            let audioPath = String(cString: sqlite3_column_text(stmt, 4))
+            let numSpeakers = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? Int(sqlite3_column_int(stmt, 5)) : nil
+            let transcriptText: String? = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
+            let summary: String? = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let modelUsed: String? = sqlite3_column_type(stmt, 8) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 8)) : nil
+
+            results.append(SessionRecord(
+                id: id,
+                startTime: formatter.date(from: startStr) ?? Date(),
+                endTime: formatter.date(from: endStr) ?? Date(),
+                duration: duration,
+                audioPath: audioPath,
+                numSpeakers: numSpeakers,
+                transcriptText: transcriptText,
+                summary: summary,
+                modelUsed: modelUsed
+            ))
+        }
+
+        return results
     }
 
     // MARK: - Private
@@ -420,24 +746,98 @@ public final class Storage {
         return results
     }
 
-    private func appendToDailyFile(_ entry: TranscriptEntry) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        let filename = formatter.string(from: entry.timestamp)
-        let path = "\(config.transcriptsDir)/\(filename).txt"
+}
 
-        let speaker = entry.speakerLabel
-        let line = "[\(entry.timeString)] [\(speaker)] \(entry.text)\n"
-        guard let data = line.data(using: .utf8) else { return }
+// MARK: - Session Folder Files
 
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            try? data.write(to: URL(fileURLWithPath: path))
+public struct TranscriptDocument: Codable {
+    public let version: Int
+    public let startTime: String
+    public let duration: Double
+    public let numSpeakers: Int
+    public let segments: [TranscriptSegment]
+
+    public init(startTime: Date, duration: Double, numSpeakers: Int, segments: [TranscriptSegment]) {
+        self.version = 1
+        let fmt = ISO8601DateFormatter()
+        self.startTime = fmt.string(from: startTime)
+        self.duration = duration
+        self.numSpeakers = numSpeakers
+        self.segments = segments
+    }
+}
+
+public struct TranscriptSegment: Codable {
+    public let speaker: String
+    public let start: Double
+    public let end: Double
+    public let text: String
+
+    public init(speaker: String, start: Double, end: Double, text: String) {
+        self.speaker = speaker
+        self.start = start
+        self.end = end
+        self.text = text
+    }
+}
+
+public struct SessionMetadata: Codable {
+    public let startTime: String
+    public let endTime: String
+    public let duration: Double
+    public let numSpeakers: Int
+    public let modelUsed: String?
+
+    public init(startTime: Date, endTime: Date, duration: Double, numSpeakers: Int, modelUsed: String?) {
+        let fmt = ISO8601DateFormatter()
+        self.startTime = fmt.string(from: startTime)
+        self.endTime = fmt.string(from: endTime)
+        self.duration = duration
+        self.numSpeakers = numSpeakers
+        self.modelUsed = modelUsed
+    }
+}
+
+extension Storage {
+    /// Write transcript.json to session folder
+    public static func saveTranscriptJSON(sessionDir: String, document: TranscriptDocument) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(document)
+        try data.write(to: URL(fileURLWithPath: "\(sessionDir)/transcript.json"))
+    }
+
+    /// Load transcript.json from session folder
+    public static func loadTranscriptJSON(sessionDir: String) -> TranscriptDocument? {
+        let path = "\(sessionDir)/transcript.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        return try? JSONDecoder().decode(TranscriptDocument.self, from: data)
+    }
+
+    /// Write transcript.txt to session folder
+    public static func saveTranscriptText(sessionDir: String, text: String) throws {
+        try text.write(toFile: "\(sessionDir)/transcript.txt", atomically: true, encoding: .utf8)
+    }
+
+    /// Write summary.md to session folder
+    public static func saveSummary(sessionDir: String, summary: String) throws {
+        try summary.write(toFile: "\(sessionDir)/summary.md", atomically: true, encoding: .utf8)
+    }
+
+    /// Write metadata.json to session folder
+    public static func saveMetadata(sessionDir: String, metadata: SessionMetadata) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(metadata)
+        try data.write(to: URL(fileURLWithPath: "\(sessionDir)/metadata.json"))
+    }
+
+    /// Resolve the audio file path from a session path (folder or legacy file)
+    public static func audioFilePath(for sessionPath: String) -> String {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: sessionPath, isDirectory: &isDir), isDir.boolValue {
+            return "\(sessionPath)/audio.raw"
         }
+        return sessionPath
     }
 }

@@ -14,6 +14,9 @@ public final class EdwardDaemon {
     private var isRunning = false
     public let configHash: Int
 
+    // Session recording
+    private var sessionRecorder: SessionRecorder?
+
     // Auto-diarization state
     private var lastSpeechTime: Date?
     private var undiarizedEntryCount: Int = 0
@@ -33,6 +36,9 @@ public final class EdwardDaemon {
 
     /// Callback fired when offline diarization completes
     public var onDiarizationComplete: ((Int, Int) -> Void)?
+
+    /// Callback fired when session finalization completes (diarized transcript + summary)
+    public var onSessionComplete: ((SessionResult) -> Void)?
 
     public init(config: EdwardConfig = .default) {
         self.config = config
@@ -115,6 +121,16 @@ public final class EdwardDaemon {
 
         captureStartTime = Date()
 
+        // Start session recording
+        if config.enableSessionRecording {
+            let recorder = SessionRecorder(sampleRate: config.sampleRate)
+            try recorder.start(sessionsDir: config.sessionsDir)
+            self.sessionRecorder = recorder
+            for pipeline in pipelines {
+                pipeline.sessionRecorder = recorder
+            }
+        }
+
         for pipeline in pipelines {
             do {
                 try pipeline.start()
@@ -137,7 +153,22 @@ public final class EdwardDaemon {
         silenceTimer = nil
 
         for pipeline in pipelines {
+            pipeline.sessionRecorder = nil
             pipeline.stop()
+        }
+
+        // Finalize session recording
+        if let sessionInfo = sessionRecorder?.stop() {
+            sessionRecorder = nil
+            let finalizer = SessionFinalizer(config: config)
+            Task {
+                do {
+                    let result = try await finalizer.finalize(session: sessionInfo, storage: storage)
+                    onSessionComplete?(result)
+                } catch {
+                    log.error("Session finalization failed: \(error)")
+                }
+            }
         }
 
         isRunning = false

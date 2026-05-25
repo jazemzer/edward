@@ -12,14 +12,14 @@ bundle: build
 		cp .build/debug/Edward Edward.app/Contents/MacOS/Edward; \
 		cp .build/debug/mlx.metallib Edward.app/Contents/MacOS/mlx.metallib; \
 		codesign --force --sign - Edward.app/Contents/MacOS/mlx.metallib; \
-		echo "Built Edward.app (binary changed)"; \
+		codesign --force --sign - Edward.app; \
+		echo "Built Edward.app (binary changed, re-signed)"; \
 	else \
 		echo "Edward.app binary is up to date"; \
 	fi
-	codesign --force --sign - Edward.app
 
 run: bundle
-	open Edward.app
+	@pkill -x Edward 2>/dev/null; sleep 0.5; open Edward.app
 
 clean:
 	swift package clean

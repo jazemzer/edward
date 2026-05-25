@@ -20,8 +20,15 @@ public final class VADProcessor {
         log.info("Loading Silero VAD model...")
         let vad = try await SileroVADModel.fromPretrained()
         self.model = vad
-        self.processor = StreamingVADProcessor(model: vad)
-        log.info("Silero VAD loaded")
+
+        var vadConfig = VADConfig.sileroDefault
+        vadConfig.onset = config.vadOnsetThreshold
+        vadConfig.offset = config.vadOffsetThreshold
+        vadConfig.minSpeechDuration = Float(config.minSpeechDuration)
+        vadConfig.minSilenceDuration = Float(config.minSilenceDuration)
+        self.processor = StreamingVADProcessor(model: vad, config: vadConfig)
+
+        log.info("Silero VAD loaded (minSilence: \(config.minSilenceDuration)s, onset: \(config.vadOnsetThreshold))")
     }
 
     /// Process a chunk of audio samples (should be 512 samples = 32ms at 16kHz)

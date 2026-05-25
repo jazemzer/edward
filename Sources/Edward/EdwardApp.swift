@@ -22,6 +22,11 @@ struct EdwardApp: App {
 
 struct MainWindowView: View {
     @ObservedObject var viewModel: EdwardViewModel
+    @State private var selectedTab: MainTab = .live
+
+    enum MainTab {
+        case live, sessions
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -30,11 +35,27 @@ struct MainWindowView: View {
 
             Divider()
 
-            // Transcript content
-            TranscriptContentView(viewModel: viewModel)
+            // Tab picker
+            Picker("", selection: $selectedTab) {
+                Text("Live").tag(MainTab.live)
+                Text("Sessions").tag(MainTab.sessions)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+
+            Divider()
+
+            // Tab content
+            switch selectedTab {
+            case .live:
+                TranscriptContentView(viewModel: viewModel)
+            case .sessions:
+                SessionsListView(viewModel: viewModel)
+            }
 
             // Fixed partial transcription bar
-            if let partial = viewModel.partialText {
+            if selectedTab == .live, let partial = viewModel.partialText {
                 Divider()
                 HStack(alignment: .top, spacing: 8) {
                     ProgressView()
@@ -52,6 +73,12 @@ struct MainWindowView: View {
                 .background(Color(nsColor: .controlBackgroundColor))
             }
         }
+        .sheet(isPresented: $viewModel.showSessionSummary) {
+            SessionSummaryView(result: viewModel.sessionResult, isPresented: $viewModel.showSessionSummary)
+        }
+        .onAppear {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
     }
 }
 
@@ -59,6 +86,7 @@ struct MainWindowView: View {
 
 struct ControlBarView: View {
     @ObservedObject var viewModel: EdwardViewModel
+    @State private var showSettings = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -73,6 +101,22 @@ struct ControlBarView: View {
                 }
 
                 Spacer()
+
+                // Settings button
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gear")
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isRunning)
+
+                // Copilot toggle button
+                Button(action: { viewModel.toggleCopilot() }) {
+                    Image(systemName: viewModel.showCopilot ? "sparkles" : "sparkles")
+                        .foregroundColor(viewModel.showCopilot ? .yellow : .primary)
+                }
+                .buttonStyle(.plain)
+                .disabled(!viewModel.isRunning)
+                .help("Toggle AI Copilot panel")
 
                 // Start/Stop button
                 Button(action: { viewModel.toggleDaemon() }) {
@@ -110,53 +154,12 @@ struct ControlBarView: View {
                     }
                 }
             }
-
-            // Languages row
-            HStack(spacing: 8) {
-                Text("Languages")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .frame(width: 65, alignment: .leading)
-                ForEach(availableLanguages) { lang in
-                    LanguageToggle(
-                        lang: lang,
-                        isSelected: viewModel.selectedLanguages.contains(lang.id),
-                        isDisabled: viewModel.isRunning
-                    ) {
-                        viewModel.toggleLanguage(lang.id)
-                    }
-                }
-            }
-
-            // Sources row
-            HStack(spacing: 8) {
-                Text("Sources")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .frame(width: 65, alignment: .leading)
-                SourceToggle(
-                    label: "Mic",
-                    icon: "mic.fill",
-                    isSelected: viewModel.enableMicCapture,
-                    isDisabled: viewModel.isRunning
-                ) {
-                    viewModel.enableMicCapture.toggle()
-                }
-                ForEach(viewModel.systemAudioApps.indices, id: \.self) { idx in
-                    SourceToggle(
-                        label: viewModel.systemAudioApps[idx].label,
-                        icon: "speaker.wave.2.fill",
-                        isSelected: viewModel.systemAudioApps[idx].enabled,
-                        isDisabled: viewModel.isRunning
-                    ) {
-                        viewModel.systemAudioApps[idx].enabled.toggle()
-                        viewModel.enableSystemAudioCapture = viewModel.systemAudioApps.contains { $0.enabled }
-                    }
-                }
-            }
         }
         .padding()
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(isPresented: $showSettings) {
+            SettingsDialogView(viewModel: viewModel, isPresented: $showSettings)
+        }
     }
 }
 
@@ -217,7 +220,9 @@ struct TranscriptContentView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(filteredTranscripts, id: \.id) { entry in
-                                TranscriptRowView(entry: entry)
+                                TranscriptRowView(entry: entry, onDelete: {
+                                    viewModel.deleteTranscript(entry)
+                                })
                                     .onAppear {
                                         if entry.id == filteredTranscripts.last?.id {
                                             autoScroll = true
@@ -267,6 +272,7 @@ let availableLanguages: [LanguageOption] = [
 class EdwardViewModel: ObservableObject {
     @Published var isRunning = false
     @Published var isLoading = false
+    @Published var isFinalizingSession = false
     @Published var transcripts: [TranscriptEntry] = []
     @Published var statusText = "Stopped"
     @Published var errorMessage: String?
@@ -275,6 +281,10 @@ class EdwardViewModel: ObservableObject {
     @Published var enableMicCapture: Bool = true
     @Published var enableSystemAudioCapture: Bool = true
     @Published var systemAudioApps: [SystemAudioApp] = SystemAudioApp.defaults
+    @Published var sessionResult: SessionResult?
+    @Published var showSessionSummary = false
+    @Published var sessions: [SessionRecord] = []
+    @Published var retranscribingSessionId: Int64?
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled {
         didSet {
             do {
@@ -293,8 +303,27 @@ class EdwardViewModel: ObservableObject {
             UserDefaults.standard.set(startOnLaunch, forKey: "startOnLaunch")
         }
     }
+    @Published var dataDir: String = UserDefaults.standard.string(forKey: "dataDir") ?? EdwardConfig.default.dataDir {
+        didSet {
+            UserDefaults.standard.set(dataDir, forKey: "dataDir")
+        }
+    }
+    @Published var ollamaModel: String = UserDefaults.standard.string(forKey: "ollamaModel") ?? EdwardConfig.default.ollamaModel {
+        didSet {
+            UserDefaults.standard.set(ollamaModel, forKey: "ollamaModel")
+        }
+    }
+    @Published var ollamaBaseURL: String = UserDefaults.standard.string(forKey: "ollamaBaseURL") ?? EdwardConfig.default.ollamaBaseURL {
+        didSet {
+            UserDefaults.standard.set(ollamaBaseURL, forKey: "ollamaBaseURL")
+        }
+    }
+    @Published var availableOllamaModels: [String] = []
+    @Published var showCopilot: Bool = false
 
     private var daemon: EdwardDaemon?
+    private(set) var copilotEngine: CopilotEngine?
+    private var copilotOverlay: CopilotOverlayController?
 
     init() {
         // Load saved language preferences
@@ -304,11 +333,16 @@ class EdwardViewModel: ObservableObject {
         }
 
         // Load recent transcripts from database
-        let config = EdwardConfig.load()
+        var config = EdwardConfig.load()
+        config.dataDir = dataDir
         let storage = Storage(config: config)
         if let _ = try? storage.open(),
            let recent = try? storage.recent(limit: 50) {
             transcripts = recent.reversed()
+        }
+        if let _ = try? storage.open(),
+           let pastSessions = try? storage.recentSessions(limit: 20) {
+            sessions = pastSessions
         }
 
         // Auto-start listening if preference is set
@@ -358,6 +392,7 @@ class EdwardViewModel: ObservableObject {
         config.enableMicCapture = enableMicCapture
         config.enableSystemAudioCapture = enableSystemAudioCapture
         config.systemAudioApps = systemAudioApps
+        config.dataDir = dataDir
 
         // Recreate daemon if config changed
         if let existing = daemon, existing.configHash != config.configHash {
@@ -377,6 +412,7 @@ class EdwardViewModel: ObservableObject {
                     if (self?.transcripts.count ?? 0) > 200 {
                         self?.transcripts.removeFirst()
                     }
+                    self?.copilotEngine?.addTranscript(text: entry.text, timestamp: entry.timestamp)
                 }
             }
 
@@ -391,6 +427,14 @@ class EdwardViewModel: ObservableObject {
                     if let idx = self?.transcripts.firstIndex(where: { $0.id == entryId }) {
                         self?.transcripts[idx].wordTimestamps = timestamps
                     }
+                }
+            }
+
+            d.onSessionComplete = { [weak self] result in
+                Task { @MainActor in
+                    self?.sessionResult = result
+                    self?.showSessionSummary = true
+                    self?.loadSessions()
                 }
             }
 
@@ -412,6 +456,11 @@ class EdwardViewModel: ObservableObject {
             isLoading = false
             let sources = daemon!.activeSources.joined(separator: " + ")
             statusText = "Listening (\(languageSummary)) — \(sources)"
+
+            // Start copilot engine
+            let engine = CopilotEngine(model: ollamaModel, baseURL: ollamaBaseURL)
+            self.copilotEngine = engine
+            engine.start()
 
             // Check for failed sources after system audio pipelines have had time to start
             let d = daemon!
@@ -440,9 +489,140 @@ class EdwardViewModel: ObservableObject {
 
     func stop() {
         daemon?.stop()
+        copilotEngine?.stop()
         isRunning = false
         partialText = nil
         statusText = "Stopped"
+    }
+
+    func toggleCopilot() {
+        guard let engine = copilotEngine else { return }
+        if copilotOverlay == nil {
+            copilotOverlay = CopilotOverlayController(engine: engine)
+        }
+        copilotOverlay?.toggle()
+        showCopilot = copilotOverlay?.isVisible ?? false
+    }
+
+    func loadSessions() {
+        var config = EdwardConfig.load()
+        config.dataDir = dataDir
+        let storage = Storage(config: config)
+        if let _ = try? storage.open(),
+           let pastSessions = try? storage.recentSessions(limit: 20) {
+            sessions = pastSessions
+        }
+    }
+
+    func deleteTranscript(_ entry: TranscriptEntry) {
+        var config = EdwardConfig.load()
+        config.dataDir = dataDir
+        let storage = Storage(config: config)
+        guard let _ = try? storage.open() else { return }
+        try? storage.deleteTranscript(id: entry.id)
+        transcripts.removeAll { $0.id == entry.id }
+    }
+
+    func renameSession(_ session: SessionRecord, newName: String) {
+        var config = EdwardConfig.load()
+        config.dataDir = dataDir
+        let storage = Storage(config: config)
+        guard let _ = try? storage.open(),
+              let newPath = try? storage.renameSession(id: session.id, newName: newName) else { return }
+        if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
+            sessions[idx] = SessionRecord(
+                id: session.id, startTime: session.startTime, endTime: session.endTime,
+                duration: session.duration, audioPath: newPath,
+                numSpeakers: session.numSpeakers, transcriptText: session.transcriptText,
+                summary: session.summary, modelUsed: session.modelUsed
+            )
+        }
+    }
+
+    func deleteSession(_ session: SessionRecord) {
+        var config = EdwardConfig.load()
+        config.dataDir = dataDir
+        let storage = Storage(config: config)
+        guard let _ = try? storage.open() else { return }
+        try? storage.deleteSession(id: session.id)
+        sessions.removeAll { $0.id == session.id }
+    }
+
+    func copySessionTranscript(_ session: SessionRecord) {
+        guard let text = session.transcriptText else { return }
+        // Strip speaker labels like "[Speaker 1] " from lines
+        let cleaned = text.components(separatedBy: .newlines).map { line in
+            if let range = line.range(of: #"^\[.*?\]\s*"#, options: .regularExpression) {
+                return String(line[range.upperBound...])
+            }
+            return line
+        }.joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(cleaned, forType: .string)
+    }
+
+    func generateSessionSummary(_ session: SessionRecord) {
+        guard let transcript = session.transcriptText else { return }
+        let client = OllamaClient(model: ollamaModel, baseURL: ollamaBaseURL)
+
+        Task {
+            let prompt = "Summarize the following transcript concisely. Focus on key topics, decisions, and action items:\n\n\(transcript)"
+            do {
+                let summary = try await client.generate(prompt: prompt, system: "You are a helpful assistant that summarizes meeting transcripts concisely.")
+
+                var cfg = EdwardConfig.load()
+                cfg.dataDir = self.dataDir
+                let storage = Storage(config: cfg)
+                guard let _ = try? storage.open() else { return }
+                try storage.updateSessionSummary(id: session.id, summary: summary)
+                self.loadSessions()
+            } catch {
+                self.errorMessage = "Summary failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func retranscribeSession(_ session: SessionRecord) {
+        guard retranscribingSessionId == nil else {
+            errorMessage = "Retranscription already in progress"
+            return
+        }
+        retranscribingSessionId = session.id
+
+        Task {
+            do {
+                var cfg = EdwardConfig.load()
+                cfg.dataDir = self.dataDir
+                let storage = Storage(config: cfg)
+                try storage.open()
+
+                let finalizer = SessionFinalizer(config: cfg)
+                let result = try await finalizer.retranscribe(session: session, storage: storage)
+
+                self.retranscribingSessionId = nil
+                self.sessionResult = result
+                self.loadSessions()
+            } catch {
+                self.retranscribingSessionId = nil
+                self.errorMessage = "Retranscription failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func fetchOllamaModels() {
+        Task {
+            guard let url = URL(string: "\(ollamaBaseURL)/api/tags") else { return }
+            do {
+                let (data, _) = try await URLSession.shared.data(from: url)
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let models = json["models"] as? [[String: Any]] {
+                    let names = models.compactMap { $0["name"] as? String }.sorted()
+                    self.availableOllamaModels = names
+                }
+            } catch {
+                self.availableOllamaModels = []
+            }
+        }
     }
 }
 
@@ -556,13 +736,297 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Storage") {
+                Text("Folder where audio recordings and transcripts are saved.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                HStack {
+                    Text(viewModel.dataDir)
+                        .font(.system(.caption, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Choose...") {
+                        let panel = NSOpenPanel()
+                        panel.canChooseFiles = false
+                        panel.canChooseDirectories = true
+                        panel.canCreateDirectories = true
+                        panel.allowsMultipleSelection = false
+                        if panel.runModal() == .OK, let url = panel.url {
+                            viewModel.dataDir = url.path
+                        }
+                    }
+                }
+
+                Button("Reset to Default") {
+                    viewModel.dataDir = EdwardConfig.default.dataDir
+                }
+                .font(.caption)
+            }
+
             Section("General") {
                 Toggle("Launch at Login", isOn: $viewModel.launchAtLogin)
                 Toggle("Start Listening on Launch", isOn: $viewModel.startOnLaunch)
             }
         }
         .formStyle(.grouped)
-        .frame(width: 400, height: 400)
+        .frame(width: 400, height: 450)
+    }
+}
+
+// MARK: - Settings Dialog (opened from gear button)
+
+enum SettingsCategory: String, CaseIterable, Identifiable {
+    case general = "General"
+    case languages = "Languages"
+    case audioSources = "Audio Sources"
+    case ai = "AI"
+    case storage = "Storage"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .general: return "gear"
+        case .languages: return "globe"
+        case .audioSources: return "waveform"
+        case .ai: return "sparkles"
+        case .storage: return "folder"
+        }
+    }
+}
+
+struct SettingsDialogView: View {
+    @ObservedObject var viewModel: EdwardViewModel
+    @Binding var isPresented: Bool
+    @State private var selectedCategory: SettingsCategory = .general
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Settings")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Spacer()
+                Button("Done") { isPresented = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+
+            Divider()
+
+            HSplitView {
+                // Sidebar
+                List(SettingsCategory.allCases, selection: $selectedCategory) { category in
+                    Label(category.rawValue, systemImage: category.icon)
+                        .tag(category)
+                }
+                .listStyle(.sidebar)
+                .frame(minWidth: 140, idealWidth: 160, maxWidth: 180)
+
+                // Detail panel
+                Group {
+                    switch selectedCategory {
+                    case .general:
+                        SettingsGeneralPane(viewModel: viewModel)
+                    case .languages:
+                        SettingsLanguagesPane(viewModel: viewModel)
+                    case .audioSources:
+                        SettingsAudioSourcesPane(viewModel: viewModel)
+                    case .ai:
+                        SettingsAIPane(viewModel: viewModel)
+                    case .storage:
+                        SettingsStoragePane(viewModel: viewModel)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(width: 550, height: 420)
+    }
+}
+
+// MARK: - Settings Panes
+
+struct SettingsGeneralPane: View {
+    @ObservedObject var viewModel: EdwardViewModel
+
+    var body: some View {
+        Form {
+            Toggle("Launch at Login", isOn: $viewModel.launchAtLogin)
+            Toggle("Start Listening on Launch", isOn: $viewModel.startOnLaunch)
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct SettingsLanguagesPane: View {
+    @ObservedObject var viewModel: EdwardViewModel
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Select which languages are spoken. The ASR model will prioritize these.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                ForEach(availableLanguages) { lang in
+                    Toggle(isOn: Binding(
+                        get: { viewModel.selectedLanguages.contains(lang.id) },
+                        set: { _ in viewModel.toggleLanguage(lang.id) }
+                    )) {
+                        HStack {
+                            Text(lang.flag)
+                                .font(.caption)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 2)
+                                .background(Color.gray.opacity(0.2))
+                                .cornerRadius(3)
+                            Text(lang.name)
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct SettingsAudioSourcesPane: View {
+    @ObservedObject var viewModel: EdwardViewModel
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Configure which audio sources to capture.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Toggle("Microphone", isOn: $viewModel.enableMicCapture)
+                Toggle("System Audio", isOn: $viewModel.enableSystemAudioCapture)
+            }
+
+            if viewModel.enableSystemAudioCapture {
+                Section("Applications") {
+                    ForEach(viewModel.systemAudioApps.indices, id: \.self) { idx in
+                        Toggle(isOn: $viewModel.systemAudioApps[idx].enabled) {
+                            VStack(alignment: .leading) {
+                                Text(viewModel.systemAudioApps[idx].label)
+                                Text(viewModel.systemAudioApps[idx].bundleId)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct SettingsAIPane: View {
+    @ObservedObject var viewModel: EdwardViewModel
+    @State private var connectionStatus: String?
+
+    var body: some View {
+        Form {
+            Section("Ollama") {
+                Text("Local LLM used for session summarization.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                HStack {
+                    Text("Server URL")
+                        .frame(width: 80, alignment: .leading)
+                    TextField("http://localhost:11434", text: $viewModel.ollamaBaseURL)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                HStack {
+                    Text("Model")
+                        .frame(width: 80, alignment: .leading)
+                    if viewModel.availableOllamaModels.isEmpty {
+                        TextField("Model name", text: $viewModel.ollamaModel)
+                            .textFieldStyle(.roundedBorder)
+                    } else {
+                        Picker("", selection: $viewModel.ollamaModel) {
+                            ForEach(viewModel.availableOllamaModels, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                    Button("Refresh") {
+                        viewModel.fetchOllamaModels()
+                    }
+                    .font(.caption)
+                }
+
+                if let status = connectionStatus {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundColor(status.contains("Connected") ? .green : .red)
+                }
+
+                Button("Test Connection") {
+                    testConnection()
+                }
+                .font(.caption)
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            viewModel.fetchOllamaModels()
+        }
+    }
+
+    private func testConnection() {
+        connectionStatus = nil
+        let client = OllamaClient(model: viewModel.ollamaModel, baseURL: viewModel.ollamaBaseURL)
+        Task {
+            let available = await client.isAvailable()
+            connectionStatus = available ? "Connected" : "Cannot reach Ollama at \(viewModel.ollamaBaseURL)"
+        }
+    }
+}
+
+struct SettingsStoragePane: View {
+    @ObservedObject var viewModel: EdwardViewModel
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Folder where audio recordings and transcripts are saved.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                HStack {
+                    Text(viewModel.dataDir)
+                        .font(.system(.caption, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Choose...") {
+                        let panel = NSOpenPanel()
+                        panel.canChooseFiles = false
+                        panel.canChooseDirectories = true
+                        panel.canCreateDirectories = true
+                        panel.allowsMultipleSelection = false
+                        if panel.runModal() == .OK, let url = panel.url {
+                            viewModel.dataDir = url.path
+                        }
+                    }
+                }
+
+                Button("Reset to Default") {
+                    viewModel.dataDir = EdwardConfig.default.dataDir
+                }
+                .font(.caption)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -570,6 +1034,7 @@ struct SettingsView: View {
 
 struct TranscriptRowView: View {
     let entry: TranscriptEntry
+    var onDelete: (() -> Void)?
     @State private var showWordTimestamps = false
 
     private var speakerColor: Color {
@@ -635,6 +1100,13 @@ struct TranscriptRowView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
+        .contextMenu {
+            Button(role: .destructive) {
+                onDelete?()
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        }
     }
 
     private func sourceDisplayName(_ source: String) -> String {
@@ -715,5 +1187,538 @@ struct FlowLayout: Layout {
         }
 
         return (CGSize(width: maxWidth, height: y + rowHeight), positions)
+    }
+}
+
+// MARK: - Sessions List View
+
+struct SessionsListView: View {
+    @ObservedObject var viewModel: EdwardViewModel
+    @State private var selectedSessionId: Int64?
+    @State private var renamingSession: SessionRecord?
+    @State private var renameText = ""
+    @State private var sessionToDelete: SessionRecord?
+    @State private var showDeleteConfirmation = false
+
+    private var selectedSession: SessionRecord? {
+        guard let id = selectedSessionId else { return nil }
+        return viewModel.sessions.first { $0.id == id }
+    }
+
+    var body: some View {
+        if viewModel.sessions.isEmpty {
+            VStack(spacing: 8) {
+                Spacer()
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.largeTitle)
+                    .foregroundColor(.secondary)
+                Text("No sessions yet")
+                    .foregroundColor(.secondary)
+                Text("Sessions appear here after you stop a recording")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+        } else {
+            GeometryReader { geo in
+                HStack(spacing: 0) {
+                    // Session list
+                    List(viewModel.sessions, selection: $selectedSessionId) { session in
+                        SessionRowView(session: session)
+                            .tag(session.id)
+                            .popover(isPresented: Binding(
+                                get: { renamingSession?.id == session.id },
+                                set: { if !$0 { renamingSession = nil } }
+                            )) {
+                                RenamePopover(
+                                    text: $renameText,
+                                    onCommit: {
+                                        if !renameText.isEmpty {
+                                            viewModel.renameSession(session, newName: renameText)
+                                        }
+                                        renamingSession = nil
+                                    },
+                                    onCancel: { renamingSession = nil }
+                                )
+                            }
+                            .contextMenu {
+                                Button {
+                                    renameText = ((session.audioPath as NSString).lastPathComponent as NSString).deletingPathExtension
+                                    renamingSession = session
+                                } label: {
+                                    Label("Rename", systemImage: "pencil")
+                                }
+
+                                Button {
+                                    viewModel.copySessionTranscript(session)
+                                } label: {
+                                    Label("Copy Transcript", systemImage: "doc.on.doc")
+                                }
+                                .disabled(session.transcriptText == nil)
+
+                                Button {
+                                    viewModel.generateSessionSummary(session)
+                                } label: {
+                                    Label("Generate AI Summary", systemImage: "sparkles")
+                                }
+                                .disabled(session.transcriptText == nil)
+
+                                Button {
+                                    viewModel.retranscribeSession(session)
+                                } label: {
+                                    if viewModel.retranscribingSessionId == session.id {
+                                        Label("Retranscribing...", systemImage: "hourglass")
+                                    } else {
+                                        Label("Retranscribe", systemImage: "arrow.clockwise")
+                                    }
+                                }
+                                .disabled(viewModel.retranscribingSessionId != nil)
+
+                                Divider()
+
+                                Button {
+                                    let url = URL(fileURLWithPath: session.audioPath)
+                                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                                } label: {
+                                    Label("Show in Finder", systemImage: "folder")
+                                }
+
+                                Divider()
+
+                                Button(role: .destructive) {
+                                    sessionToDelete = session
+                                    showDeleteConfirmation = true
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
+                    }
+                    .listStyle(.sidebar)
+                    .frame(width: geo.size.width * 0.25)
+                    .clipped()
+
+                    Divider()
+
+                    // Session detail
+                    Group {
+                        if let session = selectedSession {
+                            SessionDetailView(session: session, viewModel: viewModel)
+                        } else {
+                            VStack {
+                                Spacer()
+                                Text("Select a session")
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .alert("Delete Session?", isPresented: $showDeleteConfirmation) {
+                Button("Cancel", role: .cancel) { sessionToDelete = nil }
+                Button("Delete", role: .destructive) {
+                    if let session = sessionToDelete {
+                        if selectedSessionId == session.id {
+                            selectedSessionId = nil
+                        }
+                        viewModel.deleteSession(session)
+                    }
+                    sessionToDelete = nil
+                }
+            } message: {
+                Text("This will permanently delete the session and its audio file. This action cannot be undone.")
+            }
+        }
+    }
+}
+
+struct RenamePopover: View {
+    @Binding var text: String
+    var onCommit: () -> Void
+    var onCancel: () -> Void
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Text("Rename")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            TextField("Name", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .focused($isFocused)
+                .onSubmit {
+                    if text.isEmpty {
+                        onCancel()
+                    } else {
+                        onCommit()
+                    }
+                }
+                .onExitCommand(perform: onCancel)
+                .frame(minWidth: 180)
+        }
+        .padding(12)
+        .onAppear { isFocused = true }
+    }
+}
+
+struct SessionRowView: View {
+    let session: SessionRecord
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(sessionDisplayName)
+                .font(.caption)
+                .fontWeight(.medium)
+                .lineLimit(1)
+            HStack(spacing: 6) {
+                Label(session.durationString, systemImage: "clock")
+                if let speakers = session.numSpeakers {
+                    Label("\(speakers)", systemImage: "person.2")
+                }
+            }
+            .font(.caption2)
+            .foregroundColor(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var sessionDisplayName: String {
+        let filename = (session.audioPath as NSString).lastPathComponent
+        let name = (filename as NSString).deletingPathExtension
+        if name.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
+            return session.dateString
+        }
+        return name
+    }
+}
+
+// MARK: - Session Audio Player
+
+import AVFoundation
+
+class SessionAudioPlayer: ObservableObject {
+    @Published var isPlaying = false
+    @Published var isLoaded = false
+    @Published var currentTime: Double = 0
+    @Published var duration: Double = 0
+
+    private var player: AVAudioPlayer?
+    private var timer: Timer?
+
+    func load(sessionPath: String, sampleRate: Int) {
+        player?.stop()
+        timer?.invalidate()
+        isPlaying = false
+        currentTime = 0
+
+        let audioPath = Storage.audioFilePath(for: sessionPath)
+        guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: audioPath)) else {
+            isLoaded = false
+            return
+        }
+
+        let wavData = createWAVData(from: rawData, sampleRate: sampleRate)
+        do {
+            player = try AVAudioPlayer(data: wavData)
+            player?.prepareToPlay()
+            duration = player?.duration ?? 0
+            isLoaded = true
+        } catch {
+            isLoaded = false
+        }
+    }
+
+    func play() {
+        player?.play()
+        isPlaying = true
+        startTimer()
+    }
+
+    func pause() {
+        player?.pause()
+        isPlaying = false
+        timer?.invalidate()
+    }
+
+    func togglePlayPause() {
+        if isPlaying { pause() } else { play() }
+    }
+
+    func seek(to time: Double) {
+        player?.currentTime = time
+        currentTime = time
+    }
+
+    private func startTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self = self, let p = self.player else { return }
+            DispatchQueue.main.async {
+                self.currentTime = p.currentTime
+                if !p.isPlaying {
+                    self.isPlaying = false
+                    self.timer?.invalidate()
+                }
+            }
+        }
+    }
+
+    private func createWAVData(from rawPCM: Data, sampleRate: Int) -> Data {
+        let numChannels: UInt16 = 1
+        let bitsPerSample: UInt16 = 32
+        let byteRate = UInt32(sampleRate) * UInt32(numChannels) * UInt32(bitsPerSample / 8)
+        let blockAlign = numChannels * (bitsPerSample / 8)
+        let dataSize = UInt32(rawPCM.count)
+        let fileSize = 36 + dataSize
+
+        var header = Data(capacity: 44)
+        header.append(contentsOf: "RIFF".utf8)
+        header.append(withUnsafeBytes(of: fileSize.littleEndian) { Data($0) })
+        header.append(contentsOf: "WAVE".utf8)
+        header.append(contentsOf: "fmt ".utf8)
+        header.append(withUnsafeBytes(of: UInt32(16).littleEndian) { Data($0) }) // chunk size
+        header.append(withUnsafeBytes(of: UInt16(3).littleEndian) { Data($0) })  // IEEE float
+        header.append(withUnsafeBytes(of: numChannels.littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: UInt32(sampleRate).littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: byteRate.littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: blockAlign.littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: bitsPerSample.littleEndian) { Data($0) })
+        header.append(contentsOf: "data".utf8)
+        header.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
+        header.append(rawPCM)
+        return header
+    }
+}
+
+struct SessionDetailView: View {
+    let session: SessionRecord
+    @ObservedObject var viewModel: EdwardViewModel
+    @StateObject private var player = SessionAudioPlayer()
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // Header
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(sessionDisplayName)
+                            .font(.title3)
+                            .fontWeight(.semibold)
+                        HStack(spacing: 12) {
+                            Label(session.durationString, systemImage: "clock")
+                            if let speakers = session.numSpeakers {
+                                Label("\(speakers) speaker\(speakers == 1 ? "" : "s")", systemImage: "person.2")
+                            }
+                            if let model = session.modelUsed {
+                                Label(model, systemImage: "cpu")
+                            }
+                        }
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+
+                        Text(session.dateString)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button(action: { viewModel.generateSessionSummary(session) }) {
+                        Label("Summarize", systemImage: "sparkles")
+                    }
+                    .disabled(session.transcriptText == nil)
+                }
+
+                // Audio player controls
+                if player.isLoaded {
+                    HStack(spacing: 12) {
+                        Button(action: { player.togglePlayPause() }) {
+                            Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.title3)
+                        }
+                        .buttonStyle(.plain)
+
+                        Text(formatTime(player.currentTime))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
+
+                        Slider(value: Binding(
+                            get: { player.currentTime },
+                            set: { player.seek(to: $0) }
+                        ), in: 0...max(player.duration, 0.1))
+
+                        Text(formatTime(player.duration))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                if let summary = session.summary {
+                    Divider()
+                    Text("Summary")
+                        .font(.headline)
+                    Text(summary)
+                        .font(.body)
+                        .textSelection(.enabled)
+                }
+
+                Divider()
+                Text("Transcript")
+                    .font(.headline)
+
+                if let segments = loadedSegments {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
+                            TranscriptLineView(
+                                segment: segment,
+                                isActive: player.isPlaying && isSegmentActive(segment),
+                                onTap: {
+                                    player.seek(to: segment.start)
+                                    player.play()
+                                }
+                            )
+                        }
+                    }
+                } else if let transcript = session.transcriptText {
+                    Text(transcript)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+            .padding()
+        }
+        .frame(maxWidth: .infinity)
+        .onAppear { player.load(sessionPath: session.audioPath, sampleRate: 16000) }
+        .onChange(of: session.id) { player.load(sessionPath: session.audioPath, sampleRate: 16000) }
+    }
+
+    private var loadedSegments: [TranscriptSegment]? {
+        Storage.loadTranscriptJSON(sessionDir: session.audioPath)?.segments
+    }
+
+    private func isSegmentActive(_ segment: TranscriptSegment) -> Bool {
+        player.currentTime >= segment.start && player.currentTime < segment.end
+    }
+
+    private var sessionDisplayName: String {
+        let filename = (session.audioPath as NSString).lastPathComponent
+        let name = (filename as NSString).deletingPathExtension
+        if name.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
+            return session.dateString
+        }
+        return name
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        let mins = Int(seconds) / 60
+        let secs = Int(seconds) % 60
+        return String(format: "%d:%02d", mins, secs)
+    }
+}
+
+struct TranscriptLineView: View {
+    let segment: TranscriptSegment
+    let isActive: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            Text(timeString)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+                .frame(width: 60, alignment: .leading)
+
+            Text(segment.speaker)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.blue)
+                .frame(width: 80, alignment: .leading)
+
+            Text(segment.text)
+                .font(.system(.body, design: .monospaced))
+                .textSelection(.enabled)
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 4)
+        .background(isActive ? Color.accentColor.opacity(0.1) : Color.clear)
+        .cornerRadius(4)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onTap)
+    }
+
+    private var timeString: String {
+        let total = Int(segment.start)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        }
+        return String(format: "%d:%02d", m, s)
+    }
+}
+
+// MARK: - Session Summary View
+
+struct SessionSummaryView: View {
+    let result: SessionResult?
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Session Summary")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Spacer()
+                if let result = result {
+                    Button(action: { revealInFinder(path: result.audioPath) }) {
+                        Label("Show in Finder", systemImage: "folder")
+                    }
+                }
+                Button("Done") { isPresented = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+
+            if let result = result {
+                HStack(spacing: 16) {
+                    Label("\(String(format: "%.0f", result.duration))s", systemImage: "clock")
+                    Label("\(result.numSpeakers) speaker\(result.numSpeakers == 1 ? "" : "s")", systemImage: "person.2")
+                }
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+                Divider()
+
+                if let summary = result.summary {
+                    Text("Summary")
+                        .font(.headline)
+                    Text(summary)
+                        .font(.body)
+                        .textSelection(.enabled)
+
+                    Divider()
+                }
+
+                Text("Diarized Transcript")
+                    .font(.headline)
+
+                ScrollView {
+                    Text(result.diarizedTranscript)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                Text("No session data available")
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding()
+        .frame(minWidth: 600, minHeight: 400)
+    }
+
+    private func revealInFinder(path: String) {
+        let url = URL(fileURLWithPath: path)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 }
