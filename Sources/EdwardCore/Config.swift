@@ -16,6 +16,9 @@ public struct EdwardConfig: Codable {
     public var enableMicCapture: Bool
     public var enableSystemAudioCapture: Bool
     public var systemAudioApps: [SystemAudioApp]
+    public var enableSessionRecording: Bool
+    public var ollamaModel: String
+    public var ollamaBaseURL: String
     public var dataDir: String
     public var logPath: String
 
@@ -34,6 +37,9 @@ public struct EdwardConfig: Codable {
         enableMicCapture: true,
         enableSystemAudioCapture: true,
         systemAudioApps: SystemAudioApp.defaults,
+        enableSessionRecording: true,
+        ollamaModel: "llama3.2",
+        ollamaBaseURL: "http://localhost:11434",
         dataDir: "~/.edward".expandingTildeInPath,
         logPath: "~/.edward/logs/edward.log".expandingTildeInPath
     )
@@ -41,11 +47,12 @@ public struct EdwardConfig: Codable {
     public var dbPath: String { "\(dataDir)/edward.db" }
     public var transcriptsDir: String { "\(dataDir)/transcripts" }
     public var audioDir: String { "\(dataDir)/audio" }
+    public var sessionsDir: String { "\(dataDir)/sessions" }
     public var logsDir: String { "\(dataDir)/logs" }
 
     public func ensureDirectories() throws {
         let fm = FileManager.default
-        for dir in [dataDir, transcriptsDir, audioDir, logsDir] {
+        for dir in [dataDir, transcriptsDir, audioDir, sessionsDir, logsDir] {
             if !fm.fileExists(atPath: dir) {
                 try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
             }

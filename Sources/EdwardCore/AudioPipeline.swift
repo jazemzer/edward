@@ -23,12 +23,21 @@ public final class AudioPipeline {
     private var speechBuffer: [Float] = []
     private var isSpeechActive = false
 
+    /// Merge timer: delays transcription to allow consecutive segments to merge
+    private var mergeTimer: DispatchSourceTimer?
+    private var mergeBuffer: [Float] = []
+    private var mergeGeneration: Int = 0
+    private let mergeWindow: TimeInterval = 1.5
+
     /// Callback fired on every new transcription
     public var onTranscription: ((TranscriptEntry) -> Void)?
     /// Callback fired with partial transcription text during speech (nil = cleared)
     public var onPartialTranscription: ((String?) -> Void)?
     /// Callback for post-transcription tasks (alignment, diarization tracking)
     public var onPostTranscription: ((TranscriptEntry, [Float]) -> Void)?
+
+    /// Optional session recorder for continuous recording
+    public var sessionRecorder: SessionRecorder?
 
     public init(source: AudioSource, config: EdwardConfig, transcriber: Transcriber, storage: Storage) {
         self.source = source
@@ -57,6 +66,7 @@ public final class AudioPipeline {
 
         try source.start { [weak self] samples in
             guard let self = self else { return }
+            self.sessionRecorder?.write(samples)
             self.lastSampleTime = Date()
             self.ringBuffer.write(samples)
             if self.isSpeechActive {
@@ -78,6 +88,18 @@ public final class AudioPipeline {
         partialGeneration += 1
         audioTimeoutTimer?.cancel()
         audioTimeoutTimer = nil
+        mergeTimer?.cancel()
+        mergeTimer = nil
+        mergeGeneration += 1
+
+        // Flush any pending merge buffer
+        if !mergeBuffer.isEmpty {
+            let audio = mergeBuffer
+            mergeBuffer = []
+            let sourceId = source.sourceId
+            Task { await self.transcribeAndStore(audio: audio, sourceId: sourceId) }
+        }
+
         isSpeechActive = false
         speechBuffer = []
         vadProcessor.flush()
@@ -115,6 +137,11 @@ public final class AudioPipeline {
         speechBuffer = []
         isSpeechActive = true
         partialGeneration += 1
+
+        // Cancel merge timer — speech resumed, keep accumulating
+        mergeTimer?.cancel()
+        mergeTimer = nil
+
         startPartialTimer()
     }
 
@@ -131,47 +158,66 @@ public final class AudioPipeline {
         partialGeneration += 1
         isSpeechActive = false
 
-        // Use the dedicated speech buffer — contains all audio since speech started
+        // Append speech to merge buffer
         let fullAudio = speechBuffer
         speechBuffer = []
         guard !fullAudio.isEmpty else { return }
 
-        let sourceId = source.sourceId
-        let maxChunkSamples = 30 * config.sampleRate // 30s chunks to avoid ASR loops
+        mergeBuffer.append(contentsOf: fullAudio)
 
-        // Split into chunks if longer than 30s
+        // Start (or restart) merge timer — transcribe only after silence persists
+        mergeTimer?.cancel()
+        mergeGeneration += 1
+        let gen = mergeGeneration
+        let sourceId = source.sourceId
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        timer.schedule(deadline: .now() + mergeWindow)
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.mergeGeneration == gen else { return }
+            let audio = self.mergeBuffer
+            self.mergeBuffer = []
+            self.mergeTimer?.cancel()
+            self.mergeTimer = nil
+            guard !audio.isEmpty else { return }
+            Task { await self.transcribeAndStore(audio: audio, sourceId: sourceId) }
+        }
+        timer.resume()
+        mergeTimer = timer
+    }
+
+    private func transcribeAndStore(audio: [Float], sourceId: String) async {
+        let maxChunkSamples = 30 * config.sampleRate
+
         var chunks: [[Float]] = []
         var offset = 0
-        while offset < fullAudio.count {
-            let end = min(offset + maxChunkSamples, fullAudio.count)
-            chunks.append(Array(fullAudio[offset..<end]))
+        while offset < audio.count {
+            let end = min(offset + maxChunkSamples, audio.count)
+            chunks.append(Array(audio[offset..<end]))
             offset = end
         }
 
-        Task {
-            for chunk in chunks {
-                do {
-                    var entry = try await transcriber.transcribe(audio: chunk, sampleRate: config.sampleRate)
+        for chunk in chunks {
+            do {
+                var entry = try await transcriber.transcribe(audio: chunk, sampleRate: config.sampleRate)
 
-                    let trimmed = Self.truncateRepetition(entry.text.trimmingCharacters(in: .whitespacesAndNewlines))
-                    guard !trimmed.isEmpty, trimmed.count > 1 else { continue }
+                let trimmed = Self.truncateRepetition(entry.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                guard !trimmed.isEmpty, trimmed.count > 1 else { continue }
 
-                    entry = TranscriptEntry(
-                        id: entry.id, timestamp: entry.timestamp, duration: entry.duration,
-                        text: trimmed, processingTime: entry.processingTime,
-                        source: sourceId
-                    )
+                entry = TranscriptEntry(
+                    id: entry.id, timestamp: entry.timestamp, duration: entry.duration,
+                    text: trimmed, processingTime: entry.processingTime,
+                    source: sourceId
+                )
 
-                    let audioPath = try storage.saveAudio(chunk, sampleRate: config.sampleRate, timestamp: entry.timestamp)
-                    entry.audioPath = audioPath
+                let audioPath = try storage.saveAudio(chunk, sampleRate: config.sampleRate, timestamp: entry.timestamp)
+                entry.audioPath = audioPath
 
-                    entry = try storage.save(entry)
+                entry = try storage.save(entry)
 
-                    onTranscription?(entry)
-                    onPostTranscription?(entry, chunk)
-                } catch {
-                    log.error("[\(sourceId)] Transcription failed: \(error)")
-                }
+                onTranscription?(entry)
+                onPostTranscription?(entry, chunk)
+            } catch {
+                log.error("[\(sourceId)] Transcription failed: \(error)")
             }
         }
     }

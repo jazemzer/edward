@@ -62,19 +62,16 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCS
     // MARK: - Private
 
     private func startCapture() async throws {
-        // Check if screen recording permission is granted, request if not yet determined
-        if !CGPreflightScreenCaptureAccess() {
-            // This triggers the system permission prompt on first call
-            let granted = CGRequestScreenCaptureAccess()
-            if !granted {
-                log.info("[\(sourceId)] Screen recording permission not granted, skipping system audio capture")
-                lastError = "Screen recording permission not granted"
-                return
-            }
-        }
-
         log.info("[\(sourceId)] Requesting shareable content...")
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        } catch {
+            log.info("[\(sourceId)] Screen recording permission not granted: \(error)")
+            lastError = "Screen recording permission not granted"
+            return
+        }
 
         log.info("[\(sourceId)] Found \(content.applications.count) apps, looking for \(bundleId)")
 
