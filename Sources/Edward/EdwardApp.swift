@@ -288,6 +288,11 @@ class EdwardViewModel: ObservableObject {
             }
         }
     }
+    @Published var startOnLaunch: Bool = UserDefaults.standard.bool(forKey: "startOnLaunch") {
+        didSet {
+            UserDefaults.standard.set(startOnLaunch, forKey: "startOnLaunch")
+        }
+    }
 
     private var daemon: EdwardDaemon?
 
@@ -304,6 +309,11 @@ class EdwardViewModel: ObservableObject {
         if let _ = try? storage.open(),
            let recent = try? storage.recent(limit: 50) {
             transcripts = recent.reversed()
+        }
+
+        // Auto-start listening if preference is set
+        if startOnLaunch {
+            Task { await start() }
         }
     }
 
@@ -548,6 +558,7 @@ struct SettingsView: View {
 
             Section("General") {
                 Toggle("Launch at Login", isOn: $viewModel.launchAtLogin)
+                Toggle("Start Listening on Launch", isOn: $viewModel.startOnLaunch)
             }
         }
         .formStyle(.grouped)
