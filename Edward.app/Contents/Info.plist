@@ -2,27 +2,27 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleExecutable</key>
-    <string>edward</string>
     <key>CFBundleIdentifier</key>
-    <string>com.edward.daemon</string>
+    <string>com.edward.app</string>
     <key>CFBundleName</key>
     <string>Edward</string>
     <key>CFBundleDisplayName</key>
     <string>Edward</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>LSUIElement</key>
     <true/>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>Edward needs microphone access to listen for speech and transcribe it in real-time.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Edward needs microphone access to transcribe speech.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Edward needs screen capture access to transcribe system audio from apps.</string>
 </dict>
 </plist>

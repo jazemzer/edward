@@ -1,14 +1,10 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
     name: "Edward",
     platforms: [
-        .macOS(.v14)
-    ],
-    products: [
-        .executable(name: "edward", targets: ["EdwardCLI"]),
-        .executable(name: "MicTest", targets: ["MicTest"]),
+        .macOS(.v15)
     ],
     dependencies: [
         .package(url: "https://github.com/soniqo/speech-swift.git", branch: "main"),
@@ -23,25 +19,22 @@ let package = Package(
                 .product(name: "AudioCommon", package: "speech-swift"),
             ],
             path: "Sources/EdwardCore",
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
                 .linkedFramework("ScreenCaptureKit"),
             ]
         ),
         .executableTarget(
-            name: "EdwardCLI",
+            name: "Edward",
             dependencies: ["EdwardCore"],
-            path: "Sources/EdwardCLI"
-        ),
-        .executableTarget(
-            name: "EdwardUI",
-            dependencies: ["EdwardCore"],
-            path: "Sources/EdwardUI"
-        ),
-        .executableTarget(
-            name: "MicTest",
-            dependencies: [],
-            path: "Sources/MicTest"
+            path: "Sources/Edward",
+            exclude: ["Info.plist"],
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ]
         ),
     ]
 )

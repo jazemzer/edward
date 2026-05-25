@@ -1,8 +1,9 @@
 import SwiftUI
+import ServiceManagement
 import EdwardCore
 
 @main
-struct EdwardUIApp: App {
+struct EdwardApp: App {
     @StateObject private var viewModel = EdwardViewModel()
 
     var body: some Scene {
@@ -274,6 +275,19 @@ class EdwardViewModel: ObservableObject {
     @Published var enableMicCapture: Bool = true
     @Published var enableSystemAudioCapture: Bool = true
     @Published var systemAudioApps: [SystemAudioApp] = SystemAudioApp.defaults
+    @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled {
+        didSet {
+            do {
+                if launchAtLogin {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                launchAtLogin = SMAppService.mainApp.status == .enabled
+            }
+        }
+    }
 
     private var daemon: EdwardDaemon?
 
@@ -530,6 +544,10 @@ struct SettingsView: View {
                         }
                     }
                 }
+            }
+
+            Section("General") {
+                Toggle("Launch at Login", isOn: $viewModel.launchAtLogin)
             }
         }
         .formStyle(.grouped)
