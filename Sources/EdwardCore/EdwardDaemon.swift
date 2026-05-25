@@ -151,23 +151,29 @@ public final class EdwardDaemon {
 
         // Start Apple Speech parallel transcription if enabled
         if enableAppleSpeech {
-            let apple = AppleSpeechTranscriber(sampleRate: config.sampleRate)
-            apple.onPartialResult = { [weak self] text in
-                self?.onAppleSpeechPartial?(text)
-            }
-            apple.onFinalResult = { [weak self] text, timestamp in
-                self?.onAppleSpeechTranscription?(text, timestamp)
-            }
-            apple.start()
-            self.appleSpeechTranscriber = apple
-
-            // Feed mic pipeline audio to Apple Speech
-            for pipeline in pipelines where pipeline.source.sourceId == "mic" {
-                pipeline.onRawSamples = { [weak apple] samples in
-                    apple?.feedSamples(samples)
+            AppleSpeechTranscriber.requestAuthorization { [weak self] authorized in
+                guard let self = self, authorized else {
+                    log.info("[AppleSpeech] Authorization denied or unavailable")
+                    return
                 }
+                let apple = AppleSpeechTranscriber(sampleRate: self.config.sampleRate)
+                apple.onPartialResult = { [weak self] text in
+                    self?.onAppleSpeechPartial?(text)
+                }
+                apple.onFinalResult = { [weak self] text, timestamp in
+                    self?.onAppleSpeechTranscription?(text, timestamp)
+                }
+                apple.start()
+                self.appleSpeechTranscriber = apple
+
+                // Feed mic pipeline audio to Apple Speech
+                for pipeline in self.pipelines where pipeline.source.sourceId == "mic" {
+                    pipeline.onRawSamples = { [weak apple] samples in
+                        apple?.feedSamples(samples)
+                    }
+                }
+                log.info("[AppleSpeech] Parallel transcription started")
             }
-            log.info("Apple Speech parallel transcription started")
         }
 
         startSilenceMonitor()

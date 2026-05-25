@@ -534,6 +534,7 @@ class EdwardViewModel: ObservableObject {
         }
 
         do {
+            daemon!.enableAppleSpeech = enableAppleSpeech
             try daemon!.start()
             isRunning = true
             isLoading = false
