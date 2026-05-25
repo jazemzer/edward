@@ -1,14 +1,13 @@
 import Foundation
 import AudioCommon
 
-/// The main Edward daemon — orchestrates audio pipelines, transcription, and output
+/// The main Edward engine — orchestrates audio pipelines, transcription, and storage
 public final class EdwardDaemon {
     private let config: EdwardConfig
     private let transcriber: Transcriber
     private let speakerTracker: SpeakerTracker
     private let forcedAligner: ForcedAlignerWrapper
     private let storage: Storage
-    private let socketServer: SocketServer
 
     private var pipelines: [AudioPipeline] = []
     private var captureStartTime: Date?
@@ -42,7 +41,6 @@ public final class EdwardDaemon {
         self.speakerTracker = SpeakerTracker(config: config)
         self.forcedAligner = ForcedAlignerWrapper()
         self.storage = Storage(config: config)
-        self.socketServer = SocketServer(socketPath: config.socketPath)
     }
 
     /// Initialize all components (loads models, opens database)
@@ -105,9 +103,6 @@ public final class EdwardDaemon {
             }
         }
 
-        // Start socket server
-        try socketServer.start()
-
         // Request notification permission
         NotificationManager.shared.requestPermission()
 
@@ -149,10 +144,9 @@ public final class EdwardDaemon {
         log.info("Edward daemon stopped")
     }
 
-    /// Fully shut down the daemon — releases all resources
+    /// Fully shut down — releases all resources
     public func shutdown() {
         stop()
-        socketServer.stop()
         try? speakerTracker.save()
         storage.close()
     }
@@ -178,8 +172,7 @@ public final class EdwardDaemon {
         return DaemonStatus(
             isRunning: isRunning,
             uptime: uptime,
-            samplesProcessed: 0,
-            connectedClients: socketServer.clientCount
+            samplesProcessed: 0
         )
     }
 
@@ -189,7 +182,6 @@ public final class EdwardDaemon {
         lastSpeechTime = Date()
         undiarizedEntryCount += 1
 
-        socketServer.broadcast(entry)
         NotificationManager.shared.notify(entry: entry)
         onTranscription?(entry)
     }
@@ -265,7 +257,6 @@ public struct DaemonStatus: Codable {
     public let isRunning: Bool
     public let uptime: Double
     public let samplesProcessed: Int
-    public let connectedClients: Int
 
     public var uptimeString: String {
         let hours = Int(uptime) / 3600

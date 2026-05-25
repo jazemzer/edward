@@ -17,7 +17,6 @@ public struct EdwardConfig: Codable {
     public var enableSystemAudioCapture: Bool
     public var systemAudioApps: [SystemAudioApp]
     public var dataDir: String
-    public var socketPath: String
     public var logPath: String
 
     public static let `default` = EdwardConfig(
@@ -36,7 +35,6 @@ public struct EdwardConfig: Codable {
         enableSystemAudioCapture: true,
         systemAudioApps: SystemAudioApp.defaults,
         dataDir: "~/.edward".expandingTildeInPath,
-        socketPath: "~/.edward/edward.sock".expandingTildeInPath,
         logPath: "~/.edward/logs/edward.log".expandingTildeInPath
     )
 

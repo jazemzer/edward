@@ -14,10 +14,7 @@ xcuserdata/
 DerivedData/
 
 # App bundles (built artifacts)
-Edward.app/Contents/MacOS/
-EdwardUI.app/Contents/MacOS/
-EdwardUI.app/Contents/Resources/
-EdwardUI.app/Contents/_CodeSignature/
+Edward.app/
 
 # MLX Metal shaders
 mlx.metallib

@@ -3,7 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.edward.ui</string>
+    <string>com.edward.app</string>
+    <key>CFBundleExecutable</key>
+    <string>Edward</string>
     <key>CFBundleName</key>
     <string>Edward</string>
     <key>CFBundleDisplayName</key>
@@ -16,6 +18,8 @@
     <string>APPL</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
