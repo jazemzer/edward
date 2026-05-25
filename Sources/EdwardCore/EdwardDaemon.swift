@@ -43,6 +43,13 @@ public final class EdwardDaemon {
     /// Callback fired immediately when session finalization begins (provides session metadata)
     public var onSessionFinalizing: ((SessionInfo) -> Void)?
 
+    /// Apple Speech parallel transcription callbacks
+    public var onAppleSpeechPartial: ((String) -> Void)?
+    public var onAppleSpeechTranscription: ((String, Date) -> Void)?
+    public var enableAppleSpeech: Bool = false
+
+    private var appleSpeechTranscriber: AppleSpeechTranscriber?
+
     public init(config: EdwardConfig = .default) {
         self.config = config
         self.configHash = config.configHash
@@ -142,6 +149,27 @@ public final class EdwardDaemon {
             }
         }
 
+        // Start Apple Speech parallel transcription if enabled
+        if enableAppleSpeech {
+            let apple = AppleSpeechTranscriber(sampleRate: config.sampleRate)
+            apple.onPartialResult = { [weak self] text in
+                self?.onAppleSpeechPartial?(text)
+            }
+            apple.onFinalResult = { [weak self] text, timestamp in
+                self?.onAppleSpeechTranscription?(text, timestamp)
+            }
+            apple.start()
+            self.appleSpeechTranscriber = apple
+
+            // Feed mic pipeline audio to Apple Speech
+            for pipeline in pipelines where pipeline.source.sourceId == "mic" {
+                pipeline.onRawSamples = { [weak apple] samples in
+                    apple?.feedSamples(samples)
+                }
+            }
+            log.info("Apple Speech parallel transcription started")
+        }
+
         startSilenceMonitor()
 
         isRunning = true
@@ -154,6 +182,10 @@ public final class EdwardDaemon {
 
         silenceTimer?.cancel()
         silenceTimer = nil
+
+        // Stop Apple Speech
+        appleSpeechTranscriber?.stop()
+        appleSpeechTranscriber = nil
 
         let pipelinesToFlush = pipelines
         let recorder = sessionRecorder

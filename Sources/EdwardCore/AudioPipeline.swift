@@ -35,6 +35,8 @@ public final class AudioPipeline {
     public var onPartialTranscription: ((String?) -> Void)?
     /// Callback for post-transcription tasks (alignment, diarization tracking)
     public var onPostTranscription: ((TranscriptEntry, [Float]) -> Void)?
+    /// Callback fired with every raw audio chunk from the source (for parallel processing)
+    public var onRawSamples: (([Float]) -> Void)?
 
     /// Optional session recorder for continuous recording
     public var sessionRecorder: SessionRecorder?
@@ -68,6 +70,7 @@ public final class AudioPipeline {
         try source.start { [weak self] samples in
             guard let self = self else { return }
             self.sessionRecorder?.write(samples)
+            self.onRawSamples?(samples)
             self.lastSampleTime = Date()
             self.ringBuffer.write(samples)
             if self.isSpeechActive {

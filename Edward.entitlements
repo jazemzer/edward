@@ -6,5 +6,7 @@
     <true/>
     <key>com.apple.security.device.camera</key>
     <false/>
+    <key>com.apple.security.speech-recognition</key>
+    <true/>
 </dict>
 </plist>

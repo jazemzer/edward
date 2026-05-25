@@ -25,6 +25,7 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
                 .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("Speech"),
             ]
         ),
         .executableTarget(
