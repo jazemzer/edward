@@ -335,11 +335,6 @@ class EdwardViewModel: ObservableObject {
             copilotEngine?.isEnabled = copilotEnabled
         }
     }
-    @Published var enableAppleSpeech: Bool = UserDefaults.standard.object(forKey: "enableAppleSpeech") as? Bool ?? false {
-        didSet {
-            UserDefaults.standard.set(enableAppleSpeech, forKey: "enableAppleSpeech")
-        }
-    }
     @Published var availableOllamaModels: [String] = []
     @Published var showCopilot: Bool = false
 
@@ -409,18 +404,6 @@ class EdwardViewModel: ObservableObject {
             Task { @MainActor in
                 self?.partialText = text
                 self?.copilotEngine?.updatePartialTranscription(text)
-            }
-        }
-
-        d.enableAppleSpeech = enableAppleSpeech
-        d.onAppleSpeechPartial = { [weak self] text in
-            Task { @MainActor in
-                self?.copilotEngine?.updateApplePartialTranscription(text)
-            }
-        }
-        d.onAppleSpeechTranscription = { [weak self] text, timestamp in
-            Task { @MainActor in
-                self?.copilotEngine?.addAppleTranscript(text: text, timestamp: timestamp)
             }
         }
 
@@ -534,7 +517,6 @@ class EdwardViewModel: ObservableObject {
         }
 
         do {
-            daemon!.enableAppleSpeech = enableAppleSpeech
             try daemon!.start()
             isRunning = true
             isLoading = false
@@ -1110,8 +1092,6 @@ struct SettingsAIPane: View {
 
             Section("Copilot") {
                 Toggle("Enable AI Copilot", isOn: $viewModel.copilotEnabled)
-                Toggle("Enable Apple Speech (comparison mode)", isOn: $viewModel.enableAppleSpeech)
-                    .help("Run Apple SFSpeechRecognizer in parallel to compare with Qwen3 ASR")
 
                 Text("System Prompt")
                     .font(.caption)

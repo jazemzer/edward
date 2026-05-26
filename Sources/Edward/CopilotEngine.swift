@@ -1,16 +1,10 @@
 import Foundation
 import EdwardCore
 
-enum TranscriptEngine: String {
-    case qwen = "Qwen"
-    case apple = "Apple"
-}
-
 struct CopilotTranscript: Identifiable {
     let id = UUID()
     let timestamp: Date
     let text: String
-    var engine: TranscriptEngine = .qwen
 }
 
 struct CopilotItem: Identifiable {
@@ -31,8 +25,6 @@ struct CopilotState {
     var statusMessage: String?
     var transcripts: [CopilotTranscript] = []
     var partialTranscription: String?
-    var appleTranscripts: [CopilotTranscript] = []
-    var applePartialTranscription: String?
 }
 
 @MainActor
@@ -149,15 +141,6 @@ final class CopilotEngine: ObservableObject {
                 state.partialTranscription = delta
             }
         }
-    }
-
-    func addAppleTranscript(text: String, timestamp: Date) {
-        state.appleTranscripts.append(CopilotTranscript(timestamp: timestamp, text: text, engine: .apple))
-        state.applePartialTranscription = nil
-    }
-
-    func updateApplePartialTranscription(_ text: String?) {
-        state.applePartialTranscription = text
     }
 
     func reset() {

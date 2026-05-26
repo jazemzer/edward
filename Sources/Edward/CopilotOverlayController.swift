@@ -258,88 +258,30 @@ struct CopilotOverlayView: View {
                 .help("Copy transcript")
                 .disabled(engine.state.transcripts.isEmpty)
             }
-
-            let hasApple = !engine.state.appleTranscripts.isEmpty || engine.state.applePartialTranscription != nil
-
-            if hasApple {
+            ForEach(engine.state.transcripts) { segment in
                 HStack(alignment: .top, spacing: 8) {
-                    // Qwen column
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Qwen3 ASR")
-                            .font(.caption2)
-                            .fontWeight(.medium)
-                            .foregroundColor(.cyan)
-                        ForEach(engine.state.transcripts) { segment in
-                            Text(segment.text)
-                                .font(.caption)
-                                .foregroundColor(.white.opacity(0.85))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if let partial = engine.state.partialTranscription, !partial.isEmpty {
-                            HStack(alignment: .top, spacing: 4) {
-                                Circle().fill(Color.red).frame(width: 5, height: 5).padding(.top, 4)
-                                Text(partial)
-                                    .font(.caption)
-                                    .foregroundColor(.white.opacity(0.7))
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Divider().background(Color.white.opacity(0.2))
-
-                    // Apple column
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Apple Speech")
-                            .font(.caption2)
-                            .fontWeight(.medium)
-                            .foregroundColor(.green)
-                        ForEach(engine.state.appleTranscripts) { segment in
-                            Text(segment.text)
-                                .font(.caption)
-                                .foregroundColor(.white.opacity(0.85))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if let partial = engine.state.applePartialTranscription, !partial.isEmpty {
-                            HStack(alignment: .top, spacing: 4) {
-                                Circle().fill(Color.green).frame(width: 5, height: 5).padding(.top, 4)
-                                Text(partial)
-                                    .font(.caption)
-                                    .foregroundColor(.white.opacity(0.7))
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(timeLabel(segment.timestamp))
+                        .font(.caption2)
+                        .foregroundColor(.white.opacity(0.35))
+                        .frame(width: 36, alignment: .trailing)
+                    Text(segment.text)
+                        .font(.callout)
+                        .foregroundColor(.white.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-            } else {
-                // Single column (Qwen only)
-                ForEach(engine.state.transcripts) { segment in
-                    HStack(alignment: .top, spacing: 8) {
-                        Text(timeLabel(segment.timestamp))
-                            .font(.caption2)
-                            .foregroundColor(.white.opacity(0.35))
-                            .frame(width: 36, alignment: .trailing)
-                        Text(segment.text)
-                            .font(.callout)
-                            .foregroundColor(.white.opacity(0.85))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .id(segment.id)
-                }
-                if let partial = engine.state.partialTranscription, !partial.isEmpty {
-                    HStack(alignment: .top, spacing: 8) {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 6, height: 6)
-                            .padding(.top, 5)
-                        Text(partial)
-                            .font(.callout)
-                            .foregroundColor(.white.opacity(0.8))
-                            .fixedSize(horizontal: false, vertical: true)
-                            .animation(.none, value: partial)
-                    }
+                .id(segment.id)
+            }
+            if let partial = engine.state.partialTranscription, !partial.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 6, height: 6)
+                        .padding(.top, 5)
+                    Text(partial)
+                        .font(.callout)
+                        .foregroundColor(.white.opacity(0.8))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .animation(.none, value: partial)
                 }
             }
         }

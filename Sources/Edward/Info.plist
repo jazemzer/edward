@@ -26,7 +26,5 @@
     <string>Edward needs microphone access to transcribe speech.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Edward needs screen capture access to transcribe system audio from apps.</string>
-    <key>NSSpeechRecognitionUsageDescription</key>
-    <string>Edward uses speech recognition to compare Apple's transcription with Qwen3 ASR.</string>
 </dict>
 </plist>
