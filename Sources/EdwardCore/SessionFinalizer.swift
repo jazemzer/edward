@@ -193,6 +193,13 @@ public final class SessionFinalizer {
         try? Storage.saveTranscriptJSON(sessionDir: sessionDir, document: transcriptDoc)
         try? Storage.saveTranscriptText(sessionDir: sessionDir, text: diarizedTranscript)
 
+        // Ensure WAV exists for playback
+        let wavPath = Storage.playbackFilePath(for: sessionDir)
+        if !FileManager.default.fileExists(atPath: wavPath) {
+            let rawPath = Storage.audioFilePath(for: sessionDir)
+            try? Storage.convertRawToALAC(rawPath: rawPath, outputPath: wavPath, sampleRate: config.sampleRate)
+        }
+
         log.info("Retranscription complete: \(merged.count) entries, \(diarResult.numSpeakers) speakers")
 
         return SessionResult(
@@ -216,66 +223,169 @@ public final class SessionFinalizer {
             throw EdwardError.storageError("Session audio file is empty")
         }
 
-        // 2. Run diarization on the full continuous audio
+        // 2. Run offline VAD with relaxed settings for fewer, longer segments
+        print("[Running offline VAD...]")
+        fflush(stdout)
+        let vad = try await SileroVADModel.fromPretrained()
+        var offlineVadConfig = VADConfig.sileroDefault
+        offlineVadConfig.onset = 0.5
+        offlineVadConfig.offset = 0.3
+        offlineVadConfig.minSpeechDuration = 0.5
+        offlineVadConfig.minSilenceDuration = 1.5
+        let speechSegments = vad.detectSpeech(audio: audio, sampleRate: config.sampleRate, config: offlineVadConfig)
+
+        log.info("Offline VAD found \(speechSegments.count) segments")
+        print("[VAD found \(speechSegments.count) speech segments]")
+        fflush(stdout)
+
+        // 3. Transcribe each segment
+        print("[Transcribing \(speechSegments.count) segments...]")
+        fflush(stdout)
+        let transcriber = Transcriber(config: config)
+        try await transcriber.load()
+
+        struct SegmentResult {
+            let startTime: Float
+            let endTime: Float
+            let text: String
+            let audio: [Float]
+        }
+
+        var segmentResults: [SegmentResult] = []
+        for seg in speechSegments {
+            let startSample = Int(seg.startTime * Float(config.sampleRate))
+            let endSample = min(Int(seg.endTime * Float(config.sampleRate)), audio.count)
+            guard endSample > startSample else { continue }
+            let segAudio = Array(audio[startSample..<endSample])
+
+            let entry = try await transcriber.transcribe(audio: segAudio, sampleRate: config.sampleRate)
+            let trimmed = AudioPipeline.truncateRepetition(entry.text.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard !trimmed.isEmpty, trimmed.count > 1 else { continue }
+
+            segmentResults.append(SegmentResult(
+                startTime: seg.startTime,
+                endTime: seg.endTime,
+                text: trimmed,
+                audio: segAudio
+            ))
+        }
+
+        // 4. Run diarization on full audio
         print("[Loading diarization pipeline...]")
         fflush(stdout)
         var pipeline: PyannoteDiarizationPipeline? = try await PyannoteDiarizationPipeline.fromPretrained()
 
         print("[Running diarization on full session audio...]")
         fflush(stdout)
-        let diarResult = pipeline!.diarize(audio: audio, sampleRate: config.sampleRate, config: DiarizationConfig(clusteringThreshold: 0.6))
-        pipeline = nil // free VRAM
+        let diarConfig = DiarizationConfig(clusteringThreshold: 0.6)
+        let diarResult = pipeline!.diarize(audio: audio, sampleRate: config.sampleRate, config: diarConfig)
+        pipeline = nil
 
         print("[Diarization complete: \(diarResult.numSpeakers) speakers, \(diarResult.segments.count) segments]")
         fflush(stdout)
 
-        // 3. Get transcript entries from this session's time range
-        let entries = try storage.entriesBetween(start: session.startTime, end: session.endTime)
+        // 5. Delete any real-time entries from this session's time range
+        try storage.deleteEntriesBetween(start: session.startTime, end: session.endTime)
 
-        // 4. Map diarization speaker labels onto transcript entries
-        for entry in entries {
-            let entryStartOffset = entry.timestamp.timeIntervalSince(session.startTime)
-            let entryEndOffset = entryStartOffset + entry.duration
-            let entryStartSample = Int(entryStartOffset * Double(config.sampleRate))
-            let entryEndSample = Int(entryEndOffset * Double(config.sampleRate))
+        // 6. Assign speaker labels to each segment
+        struct LabeledSegment {
+            let startTime: Float
+            let endTime: Float
+            let text: String
+            let audio: [Float]
+            let speakerId: String?
+            let confidence: Float?
+        }
 
+        var labeledSegments: [LabeledSegment] = []
+        for result in segmentResults {
             var bestSpeaker: (id: Int, overlap: Float)?
-            for seg in diarResult.segments {
-                let segStartSample = Int(seg.startTime * Float(config.sampleRate))
-                let segEndSample = Int(seg.endTime * Float(config.sampleRate))
-                let overlapStart = max(segStartSample, entryStartSample)
-                let overlapEnd = min(segEndSample, entryEndSample)
+            for diarSeg in diarResult.segments {
+                let overlapStart = max(diarSeg.startTime, result.startTime)
+                let overlapEnd = min(diarSeg.endTime, result.endTime)
                 let overlap = max(0, overlapEnd - overlapStart)
-
                 if overlap > 0 {
                     if let current = bestSpeaker {
-                        if overlap > Int(current.overlap) {
-                            bestSpeaker = (id: seg.speakerId, overlap: Float(overlap))
-                        }
+                        if overlap > current.overlap { bestSpeaker = (id: diarSeg.speakerId, overlap: overlap) }
                     } else {
-                        bestSpeaker = (id: seg.speakerId, overlap: Float(overlap))
+                        bestSpeaker = (id: diarSeg.speakerId, overlap: overlap)
                     }
                 }
             }
 
-            if let speaker = bestSpeaker {
-                let speakerId = "speaker_\(speaker.id + 1)"
-                let entryDuration = Float(entryEndSample - entryStartSample)
-                let confidence = entryDuration > 0 ? speaker.overlap / entryDuration : 0
-                try storage.updateSpeaker(
-                    id: entry.id,
-                    speakerId: speakerId,
-                    speakerName: nil,
-                    confidence: min(confidence, 1.0)
-                )
+            let speakerId = bestSpeaker.map { "speaker_\($0.id + 1)" }
+            let segDuration = result.endTime - result.startTime
+            let confidence = bestSpeaker.map { segDuration > 0 ? min($0.overlap / segDuration, 1.0) : Float(0) }
+
+            labeledSegments.append(LabeledSegment(
+                startTime: result.startTime,
+                endTime: result.endTime,
+                text: result.text,
+                audio: result.audio,
+                speakerId: speakerId,
+                confidence: confidence
+            ))
+        }
+
+        // 7. Merge consecutive segments from the same speaker
+        struct MergedSegment {
+            var startTime: Float
+            var endTime: Float
+            var text: String
+            var audio: [Float]
+            var speakerId: String?
+            var confidence: Float?
+        }
+
+        var merged: [MergedSegment] = []
+        for seg in labeledSegments {
+            if let last = merged.last, last.speakerId == seg.speakerId, last.speakerId != nil {
+                merged[merged.count - 1].endTime = seg.endTime
+                merged[merged.count - 1].text += " " + seg.text
+                merged[merged.count - 1].audio += seg.audio
+                if let lastConf = merged[merged.count - 1].confidence, let segConf = seg.confidence {
+                    merged[merged.count - 1].confidence = min(lastConf, segConf)
+                }
+            } else {
+                merged.append(MergedSegment(
+                    startTime: seg.startTime,
+                    endTime: seg.endTime,
+                    text: seg.text,
+                    audio: seg.audio,
+                    speakerId: seg.speakerId,
+                    confidence: seg.confidence
+                ))
             }
         }
 
-        // 5. Build diarized transcript text
+        log.info("Merged \(labeledSegments.count) segments into \(merged.count) entries")
+
+        // 8. Save merged entries
+        for seg in merged {
+            let timestamp = session.startTime.addingTimeInterval(Double(seg.startTime))
+            let segDuration = Double(seg.endTime - seg.startTime)
+
+            var entry = TranscriptEntry(
+                id: 0,
+                timestamp: timestamp,
+                duration: segDuration,
+                text: seg.text,
+                processingTime: 0,
+                speakerId: seg.speakerId,
+                speakerName: nil,
+                speakerConfidence: seg.confidence
+            )
+
+            let audioPath = try storage.saveAudio(seg.audio, sampleRate: config.sampleRate, timestamp: timestamp)
+            entry.audioPath = audioPath
+            try storage.save(entry)
+        }
+
+        // 9. Build diarized transcript text
         let updatedEntries = try storage.entriesBetween(start: session.startTime, end: session.endTime)
         let diarizedTranscript = formatDiarizedTranscript(entries: updatedEntries, sessionStart: session.startTime)
 
-        // 6. Generate summary via Ollama
+        // 10. Generate summary via Ollama
         var summary: String?
         let ollama = OllamaClient(model: config.ollamaModel, baseURL: config.ollamaBaseURL)
         if await ollama.isAvailable() {
@@ -288,7 +398,7 @@ public final class SessionFinalizer {
             log.info("Ollama not available at \(config.ollamaBaseURL), skipping summary")
         }
 
-        // 7. Save session record
+        // 11. Save session record
         let sessionId = try storage.saveSession(
             startTime: session.startTime,
             endTime: session.endTime,
@@ -300,7 +410,7 @@ public final class SessionFinalizer {
             modelUsed: summary != nil ? config.ollamaModel : nil
         )
 
-        // 8. Write session folder files
+        // 12. Write session folder files
         let sessionDir = session.path
         let segments = buildTranscriptSegments(entries: updatedEntries, sessionStart: session.startTime)
         let transcriptDoc = TranscriptDocument(
@@ -323,9 +433,14 @@ public final class SessionFinalizer {
         )
         try? Storage.saveMetadata(sessionDir: sessionDir, metadata: metadata)
 
-        print("[Session finalization complete]")
+        // 13. Convert raw audio to ALAC for playback
+        let rawPath = "\(sessionDir)/audio.raw"
+        let alacPath = "\(sessionDir)/audio.m4a"
+        try? Storage.convertRawToALAC(rawPath: rawPath, outputPath: alacPath, sampleRate: config.sampleRate)
+
+        print("[Session finalization complete: \(merged.count) entries, \(diarResult.numSpeakers) speakers]")
         fflush(stdout)
-        log.info("Session finalized: \(diarResult.numSpeakers) speakers, session ID \(sessionId)")
+        log.info("Session finalized: \(diarResult.numSpeakers) speakers, \(merged.count) entries, session ID \(sessionId)")
 
         return SessionResult(
             sessionId: sessionId,

@@ -27,7 +27,7 @@ public final class AudioPipeline {
     private var mergeTimer: DispatchSourceTimer?
     private var mergeBuffer: [Float] = []
     private var mergeGeneration: Int = 0
-    private let mergeWindow: TimeInterval = 1.5
+    private let mergeWindow: TimeInterval
 
     /// Callback fired on every new transcription
     public var onTranscription: ((TranscriptEntry) -> Void)?
@@ -44,6 +44,7 @@ public final class AudioPipeline {
         self.config = config
         self.transcriber = transcriber
         self.storage = storage
+        self.mergeWindow = config.mergeWindow
         self.ringBuffer = RingBuffer(capacity: Int(config.ringBufferDuration) * config.sampleRate)
         self.vadProcessor = VADProcessor(config: config)
     }
@@ -106,6 +107,32 @@ public final class AudioPipeline {
         source.stop()
         onPartialTranscription?(nil)
         log.info("Pipeline stopped: \(source.sourceId)")
+    }
+
+    /// Stop the pipeline and await any pending transcription flush
+    public func stopAndFlush() async {
+        partialTimer?.cancel()
+        partialTimer = nil
+        partialGeneration += 1
+        audioTimeoutTimer?.cancel()
+        audioTimeoutTimer = nil
+        mergeTimer?.cancel()
+        mergeTimer = nil
+        mergeGeneration += 1
+
+        if !mergeBuffer.isEmpty {
+            let audio = mergeBuffer
+            mergeBuffer = []
+            let sourceId = source.sourceId
+            await self.transcribeAndStore(audio: audio, sourceId: sourceId)
+        }
+
+        isSpeechActive = false
+        speechBuffer = []
+        vadProcessor.flush()
+        source.stop()
+        onPartialTranscription?(nil)
+        log.info("Pipeline stopped (flushed): \(source.sourceId)")
     }
 
     // MARK: - Audio Timeout

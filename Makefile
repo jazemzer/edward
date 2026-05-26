@@ -1,3 +1,5 @@
+CODESIGN_IDENTITY ?= Apple Development: jabezeliezer.m@gmail.com (449V62M4G7)
+
 .PHONY: build bundle run clean
 
 build:
@@ -11,8 +13,8 @@ bundle: build
 	@if ! cmp -s .build/debug/Edward Edward.app/Contents/MacOS/Edward 2>/dev/null; then \
 		cp .build/debug/Edward Edward.app/Contents/MacOS/Edward; \
 		cp .build/debug/mlx.metallib Edward.app/Contents/MacOS/mlx.metallib; \
-		codesign --force --sign - Edward.app/Contents/MacOS/mlx.metallib; \
-		codesign --force --sign - Edward.app; \
+		codesign --force --sign "$(CODESIGN_IDENTITY)" Edward.app/Contents/MacOS/mlx.metallib; \
+		codesign --force --sign "$(CODESIGN_IDENTITY)" --entitlements Edward.entitlements Edward.app; \
 		echo "Built Edward.app (binary changed, re-signed)"; \
 	else \
 		echo "Edward.app binary is up to date"; \

@@ -13,6 +13,7 @@ public struct EdwardConfig: Codable {
     public var enableNoiseSupression: Bool
     public var enableForcedAlignment: Bool
     public var partialTranscriptionInterval: Double
+    public var mergeWindow: Double
     public var enableMicCapture: Bool
     public var enableSystemAudioCapture: Bool
     public var systemAudioApps: [SystemAudioApp]
@@ -34,11 +35,12 @@ public struct EdwardConfig: Codable {
         enableNoiseSupression: false,
         enableForcedAlignment: false,
         partialTranscriptionInterval: 1.5,
+        mergeWindow: 0.5,
         enableMicCapture: true,
         enableSystemAudioCapture: true,
         systemAudioApps: SystemAudioApp.defaults,
         enableSessionRecording: true,
-        ollamaModel: "llama3.2",
+        ollamaModel: "llama3.1:8b",
         ollamaBaseURL: "http://localhost:11434",
         dataDir: "~/.edward".expandingTildeInPath,
         logPath: "~/.edward/logs/edward.log".expandingTildeInPath
